@@ -345,6 +345,70 @@ static void test_process_environment_and_models(void) {
     xair_sym_state_destroy(state); xair_sym_environment_destroy(environment); xair_sym_context_destroy(context); xair_cfg_destroy(cfg);
 }
 
+static void test_snapshot_roundtrip_preserves_state(void) {
+    xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL;
+    xair_sym_state *restored = NULL; xair_sym_snapshot *snapshot = NULL; xair_sym_snapshot *loaded_snapshot = NULL;
+    xair_block_id block; xair_value_id value; xair_sym_expr_id symbol, byte, loaded_byte; xair_sym_taint_id taint, loaded_taint;
+    xair_sym_object_id object; uint64_t model; const char *path = "xair_sym_snapshot.bin";
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &block));
+    require_xair(xair_block_add_param(module, block, xair_type_i(8), "value", &value)); require_xair(xair_set_return(module, block, &value, 1));
+    require_xair(xair_module_freeze(module)); require_sym(xair_sym_context_create(&context));
+    require_sym(xair_sym_state_create(context, module, block, &state)); require_sym(xair_sym_symbol(context, 8, "snapshot_value", &symbol));
+    require_sym(xair_sym_const(context, 8, 0x5a, &byte)); require_sym(xair_sym_taint_source(context, "snapshot_source", &taint));
+    require_sym(xair_sym_state_set_value(state, value, symbol)); require_sym(xair_sym_state_set_taint(state, value, taint));
+    require_sym(xair_sym_object_add(state, 0x4000, 4, 3, &object)); require_sym(xair_sym_memory_store8(state, 0x4001, byte));
+    require_sym(xair_sym_memory_store_taint8(state, 0x4001, taint)); require_sym(xair_sym_snapshot_take(state, &snapshot));
+    require_sym(xair_sym_snapshot_restore(snapshot, &restored)); require_sym(xair_sym_memory_load8(restored, 0x4001, &loaded_byte));
+    require_sym(xair_sym_memory_load_taint8(restored, 0x4001, &loaded_taint)); assert(loaded_byte == byte && loaded_taint == taint);
+    xair_sym_state_destroy(restored); restored = NULL;
+    remove(path); require_sym(xair_sym_snapshot_save(snapshot, path));
+    require_sym(xair_sym_snapshot_load(context, module, path, &loaded_snapshot)); remove(path);
+    require_sym(xair_sym_snapshot_restore(loaded_snapshot, &restored)); require_sym(xair_sym_model_u64(restored, symbol, &model));
+    assert(model <= 255); require_sym(xair_sym_state_get_taint(restored, value, &loaded_taint)); assert(loaded_taint == taint);
+    xair_sym_state_destroy(restored); xair_sym_snapshot_destroy(loaded_snapshot); xair_sym_snapshot_destroy(snapshot);
+    xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
+static void test_compiled_dispatch_and_cancellation(void) {
+    xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL; xair_sym_program *program = NULL;
+    xair_block_id block; xair_value_id value, one, sum; xair_sym_expr_id symbol; terminal_counts counts; xair_sym_stats stats;
+    xair_sym_cancel_token *token = NULL; xair_sym_explore_options options;
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &block));
+    require_xair(xair_block_add_param(module, block, xair_type_i(8), "value", &value));
+    require_xair(xair_build_const_u64(module, block, xair_type_i(8), 1, "one", &one));
+    require_xair(xair_build_binary(module, block, XAIR_OP_ADD, xair_type_i(8), value, one, "sum", &sum));
+    require_xair(xair_set_return(module, block, &sum, 1)); require_xair(xair_module_freeze(module));
+    require_sym(xair_sym_context_create(&context)); require_sym(xair_sym_state_create(context, module, block, &state));
+    require_sym(xair_sym_symbol(context, 8, "compiled_input", &symbol)); require_sym(xair_sym_state_set_value(state, value, symbol));
+    require_sym(xair_sym_program_compile(module, &program)); require_sym(xair_sym_state_attach_program(state, program));
+    memset(&counts, 0, sizeof(counts)); require_sym(xair_sym_explore(state, 4, 4, count_terminal, &counts)); assert(counts.count == 1);
+    xair_sym_context_stats(context, &stats); assert(stats.compiled_dispatches == 1);
+    require_sym(xair_sym_cancel_token_create(&token)); xair_sym_cancel_token_request(token);
+    xair_sym_explore_options_init(&options); options.cancel_token = token; counts.count = 0;
+    require_sym(xair_sym_explore_with_options(state, &options, count_terminal, &counts)); assert(counts.count == 0);
+    assert(xair_sym_cancel_token_requested(token)); xair_sym_cancel_token_reset(token); assert(!xair_sym_cancel_token_requested(token));
+    xair_sym_cancel_token_destroy(token); xair_sym_program_destroy(program); xair_sym_state_destroy(state);
+    xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
+static void test_parallel_isolated_workers(void) {
+    xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL; xair_sym_snapshot *snapshot = NULL;
+    xair_block_id entry, left, right; xair_value_id condition_value; xair_sym_expr_id condition;
+    xair_sym_parallel_options options; terminal_counts counts;
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &entry));
+    require_xair(xair_block_create(module, "left", &left)); require_xair(xair_block_create(module, "right", &right));
+    require_xair(xair_block_add_param(module, entry, xair_type_i(1), "condition", &condition_value));
+    require_xair(xair_set_cbranch(module, entry, condition_value, left, NULL, 0, right, NULL, 0));
+    require_xair(xair_set_return(module, left, NULL, 0)); require_xair(xair_set_return(module, right, NULL, 0));
+    require_xair(xair_module_freeze(module)); require_sym(xair_sym_context_create(&context));
+    require_sym(xair_sym_state_create(context, module, entry, &state)); require_sym(xair_sym_symbol(context, 1, "parallel_condition", &condition));
+    require_sym(xair_sym_state_set_value(state, condition_value, condition)); require_sym(xair_sym_snapshot_take(state, &snapshot));
+    xair_sym_parallel_options_init(&options); options.workers = 2; options.explore.max_states = 8; options.explore.max_block_steps = 8;
+    memset(&counts, 0, sizeof(counts)); require_sym(xair_sym_parallel_explore(snapshot, &options, count_terminal, &counts));
+    assert(counts.count == 4);
+    xair_sym_snapshot_destroy(snapshot); xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
 int main(void) {
     test_expression_interning_and_z3_model();
     test_symbolic_xair_branch_explores_both_paths();
@@ -359,5 +423,8 @@ int main(void) {
     test_dfs_policy_and_loop_budget();
     test_concolic_inversion_and_testcase_exchange();
     test_process_environment_and_models();
+    test_snapshot_roundtrip_preserves_state();
+    test_compiled_dispatch_and_cancellation();
+    test_parallel_isolated_workers();
     return 0;
 }

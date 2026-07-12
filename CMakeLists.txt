@@ -19,11 +19,15 @@ add_library(xair_sym STATIC
     src/xair_sym_taint.c
     src/xair_sym_concolic.c
     src/xair_sym_environment.c
+    src/xair_sym_program.c
+    src/xair_sym_snapshot.c
+    src/xair_sym_parallel.c
     src/xair_sym_solver_z3.c
     src/xair_sym_exec.c
 )
 target_include_directories(xair_sym PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${XAIR_SYM_Z3_INCLUDE})
-target_link_libraries(xair_sym PUBLIC xair_cfg PRIVATE ${XAIR_SYM_Z3_LIBRARY})
+find_package(Threads REQUIRED)
+target_link_libraries(xair_sym PUBLIC xair_cfg PRIVATE ${XAIR_SYM_Z3_LIBRARY} Threads::Threads)
 
 function(xair_sym_warnings target)
     if(MSVC)

@@ -3,6 +3,8 @@
 
 #include "xair_sym/xair_sym.h"
 
+#include <stdatomic.h>
+
 typedef struct {
     xair_sym_expr_kind kind;
     xair_opcode opcode;
@@ -107,6 +109,28 @@ struct xair_sym_state {
     xair_sym_memory *memory;
     size_t depth;
     xair_sym_taint_id control_taint;
+    const xair_sym_program *program;
+};
+
+typedef struct {
+    xair_op_view *ops;
+    size_t op_count;
+    xair_term_view terminator;
+} xair_sym_compiled_block;
+
+struct xair_sym_program {
+    const xair_module *module;
+    xair_sym_compiled_block *blocks;
+    size_t block_count;
+};
+
+struct xair_sym_snapshot {
+    xair_sym_state *state;
+    uint64_t module_fingerprint;
+};
+
+struct xair_sym_cancel_token {
+    atomic_bool requested;
 };
 
 struct xair_sym_trace {
@@ -130,6 +154,8 @@ void xair_sym_memory_release(xair_sym_memory *memory);
 xair_sym_status xair_sym_memory_make_unique(xair_sym_state *state);
 xair_sym_status xair_sym_memory_initialize8(
     xair_sym_state *state, uint64_t address, xair_sym_expr_id value);
+xair_sym_status xair_sym_memory_initialize_taint8(
+    xair_sym_state *state, uint64_t address, xair_sym_taint_id taint);
 xair_sym_status xair_sym_memory_load_symbolic8(
     xair_sym_state *state, xair_sym_expr_id address, xair_sym_expr_id *out_value);
 xair_sym_status xair_sym_memory_store_symbolic8(
@@ -142,5 +168,8 @@ xair_sym_status xair_sym_solver_check(
     xair_sym_expr_id model_symbol, uint64_t *out_model);
 xair_sym_status xair_sym_taint_operands(
     xair_sym_state *state, const xair_op_view *op, xair_sym_taint_id *out_taint);
+xair_sym_status xair_sym_snapshot_clone_isolated(
+    const xair_sym_snapshot *snapshot, xair_sym_context **out_context,
+    xair_sym_state **out_state);
 
 #endif

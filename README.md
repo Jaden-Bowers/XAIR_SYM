@@ -4,7 +4,8 @@ XAIR Symbolic is a C library for symbolic execution and object-based symbolic
 memory over frozen XAIR modules and XAIR CFGs. It is a separate project from the
 IR generator and CFG recovery engine and consumes their public C APIs.
 
-Current version: 0.3.0. Blocks A through D are complete.
+Current version: 0.4.0. Blocks A through E are complete at the native runtime
+baseline.
 
 Implemented:
 
@@ -43,6 +44,16 @@ Implemented:
   provenance-preserving memory copies.
 - Versioned Linux, Windows, and Windows-driver model classification for common
   allocation, input, copy, termination, probing, and completion APIs.
+- Versioned module-fingerprinted state snapshots with deterministic in-memory
+  restoration and bounded file loading.
+- Snapshot preservation of values, constraints, taint, control taint, memory
+  objects, permissions, symbolic bytes, and provenance IDs.
+- Context-isolated parallel search workers with private expression stores,
+  solver contexts, caches, and compiled dispatch plans.
+- Synchronized C callbacks and atomic cancellation tokens for parallel runs.
+- Predecoded immutable block plans that remove repeated public IR inspection
+  and operation decoding from the execution loop.
+- Public runtime version inspection.
 
 The production implementation and public API are C. There is no Python runtime
 or Python orchestration layer. Z3 is an external solver dependency used through
@@ -59,6 +70,22 @@ names. Relocation application, dynamic linking, command-line construction,
 filesystem state, and full kernel object graphs remain explicit later
 environment work. Unknown external calls are reported as unknown models rather
 than being assigned unconstrained behavior silently.
+
+Snapshot files use schema `XAIRSN01` and are checked against both the frozen
+XAIR module fingerprint and the current symbolic-context signature. File
+restoration therefore requires the same expression and provenance universe.
+Isolated workers rebuild that universe deterministically in private contexts.
+
+Parallel execution currently runs a search portfolio with BFS, DFS, and
+coverage-new workers. Terminal callbacks may observe the same terminal state
+from more than one policy. Cross-worker frontier stealing and result
+deduplication remain later scaling work.
+
+The compiled block path is a predecoded C dispatch plan, not a native-code JIT.
+It removes repeated IR accessor calls while retaining one symbolic-semantics
+implementation. Native code generation, additional solver backends, and
+executable-memory code epochs remain later performance work and must be
+benchmarked before becoming defaults.
 
 ## Build
 

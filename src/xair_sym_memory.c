@@ -108,6 +108,21 @@ xair_sym_status xair_sym_memory_initialize8(
     return XAIR_SYM_OK;
 }
 
+xair_sym_status xair_sym_memory_initialize_taint8(
+    xair_sym_state *state,
+    uint64_t address,
+    xair_sym_taint_id taint) {
+    xair_sym_object *object;
+    xair_sym_status status;
+    if (state == NULL || taint > state->context->taint_count) return XAIR_SYM_ERR_BAD_ARG;
+    status = xair_sym_memory_make_unique(state);
+    if (status != XAIR_SYM_OK) return status;
+    object = find_object(state->memory, address);
+    if (object == NULL) return XAIR_SYM_ERR_RANGE;
+    object->taints[address - object->base] = taint;
+    return XAIR_SYM_OK;
+}
+
 xair_sym_status xair_sym_memory_load8(const xair_sym_state *state, uint64_t address, xair_sym_expr_id *out_value) {
     xair_sym_object *object;
     if (state == NULL || out_value == NULL) return XAIR_SYM_ERR_BAD_ARG;

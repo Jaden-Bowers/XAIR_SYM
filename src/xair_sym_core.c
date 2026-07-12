@@ -4,6 +4,27 @@
 #include <stdio.h>
 #include <string.h>
 
+#define XAIR_SYM_VERSION_TEXT "0.4.0"
+
+const char *xair_sym_version_string(void) { return XAIR_SYM_VERSION_TEXT; }
+uint32_t xair_sym_version_u32(void) {
+    return (XAIR_SYM_VERSION_MAJOR << 16u) | (XAIR_SYM_VERSION_MINOR << 8u) | XAIR_SYM_VERSION_PATCH;
+}
+
+xair_sym_status xair_sym_cancel_token_create(xair_sym_cancel_token **out_token) {
+    xair_sym_cancel_token *token;
+    if (out_token == NULL) return XAIR_SYM_ERR_BAD_ARG;
+    token = (xair_sym_cancel_token *)malloc(sizeof(*token));
+    if (token == NULL) return XAIR_SYM_ERR_OOM;
+    atomic_init(&token->requested, 0); *out_token = token; return XAIR_SYM_OK;
+}
+void xair_sym_cancel_token_destroy(xair_sym_cancel_token *token) { free(token); }
+void xair_sym_cancel_token_request(xair_sym_cancel_token *token) { if (token != NULL) atomic_store(&token->requested, 1); }
+void xair_sym_cancel_token_reset(xair_sym_cancel_token *token) { if (token != NULL) atomic_store(&token->requested, 0); }
+int xair_sym_cancel_token_requested(const xair_sym_cancel_token *token) {
+    return token != NULL && atomic_load(&token->requested);
+}
+
 static uint64_t mix(uint64_t hash, uint64_t value) {
     hash ^= value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6u) + (hash >> 2u);
     return hash;

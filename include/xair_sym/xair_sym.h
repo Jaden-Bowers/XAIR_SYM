@@ -9,7 +9,7 @@ extern "C" {
 
 #define XAIR_SYM_INVALID_ID UINT32_MAX
 #define XAIR_SYM_VERSION_MAJOR 0u
-#define XAIR_SYM_VERSION_MINOR 3u
+#define XAIR_SYM_VERSION_MINOR 4u
 #define XAIR_SYM_VERSION_PATCH 0u
 
 typedef uint32_t xair_sym_expr_id;
@@ -71,6 +71,7 @@ typedef struct {
     size_t constraints_sliced;
     size_t scheduler_pruned;
     size_t concretizations;
+    size_t compiled_dispatches;
 } xair_sym_stats;
 
 typedef enum {
@@ -103,6 +104,8 @@ typedef enum {
     XAIR_SYM_EXEC_HYBRID_CONCRETIZE
 } xair_sym_execution_mode;
 
+typedef struct xair_sym_cancel_token xair_sym_cancel_token;
+
 typedef struct {
     size_t max_states;
     size_t max_block_steps;
@@ -110,12 +113,24 @@ typedef struct {
     size_t max_symbolic_forks;
     xair_sym_search_policy search;
     xair_sym_execution_mode execution_mode;
+    const xair_sym_cancel_token *cancel_token;
 } xair_sym_explore_options;
 
 typedef struct xair_sym_context xair_sym_context;
 typedef struct xair_sym_state xair_sym_state;
 typedef struct xair_sym_trace xair_sym_trace;
 typedef struct xair_sym_environment xair_sym_environment;
+typedef struct xair_sym_program xair_sym_program;
+typedef struct xair_sym_snapshot xair_sym_snapshot;
+typedef xair_sym_status (*xair_sym_terminal_cb)(xair_sym_state *state, void *user);
+
+const char *xair_sym_version_string(void);
+uint32_t xair_sym_version_u32(void);
+xair_sym_status xair_sym_cancel_token_create(xair_sym_cancel_token **out_token);
+void xair_sym_cancel_token_destroy(xair_sym_cancel_token *token);
+void xair_sym_cancel_token_request(xair_sym_cancel_token *token);
+void xair_sym_cancel_token_reset(xair_sym_cancel_token *token);
+int xair_sym_cancel_token_requested(const xair_sym_cancel_token *token);
 
 typedef struct {
     xair_block_id block;
@@ -219,6 +234,33 @@ xair_sym_status xair_sym_state_concretize(
     xair_sym_state *state, xair_sym_expr_id expression,
     xair_sym_expr_id *out_constant);
 
+xair_sym_status xair_sym_program_compile(
+    const xair_module *module, xair_sym_program **out_program);
+void xair_sym_program_destroy(xair_sym_program *program);
+xair_sym_status xair_sym_state_attach_program(
+    xair_sym_state *state, const xair_sym_program *program);
+
+xair_sym_status xair_sym_snapshot_take(
+    const xair_sym_state *state, xair_sym_snapshot **out_snapshot);
+void xair_sym_snapshot_destroy(xair_sym_snapshot *snapshot);
+xair_sym_status xair_sym_snapshot_restore(
+    const xair_sym_snapshot *snapshot, xair_sym_state **out_state);
+xair_sym_status xair_sym_snapshot_save(
+    const xair_sym_snapshot *snapshot, const char *path);
+xair_sym_status xair_sym_snapshot_load(
+    xair_sym_context *context, const xair_module *module, const char *path,
+    xair_sym_snapshot **out_snapshot);
+
+typedef struct {
+    size_t workers;
+    xair_sym_explore_options explore;
+} xair_sym_parallel_options;
+
+void xair_sym_parallel_options_init(xair_sym_parallel_options *options);
+xair_sym_status xair_sym_parallel_explore(
+    const xair_sym_snapshot *snapshot, const xair_sym_parallel_options *options,
+    xair_sym_terminal_cb callback, void *user);
+
 xair_sym_status xair_sym_trace_create(xair_sym_trace **out_trace);
 void xair_sym_trace_destroy(xair_sym_trace *trace);
 xair_sym_status xair_sym_trace_add_branch(
@@ -259,7 +301,6 @@ xair_sym_status xair_sym_environment_copy(
     xair_sym_environment *environment, xair_sym_state *state,
     uint64_t destination, uint64_t source, size_t size);
 
-typedef xair_sym_status (*xair_sym_terminal_cb)(xair_sym_state *state, void *user);
 xair_sym_status xair_sym_explore(
     xair_sym_state *initial, size_t max_states, size_t max_block_steps,
     xair_sym_terminal_cb callback, void *user);

@@ -151,10 +151,9 @@ static xair_sym_status execute_memory(xair_sym_state *state, const xair_op_view 
     return XAIR_SYM_ERR_UNSUPPORTED;
 }
 
-static xair_sym_status execute_op(xair_sym_state *state, xair_op_id id) {
-    xair_op_view op; xair_type out; xair_sym_expr_id args[3]; xair_sym_expr_id result;
+static xair_sym_status execute_op_view(xair_sym_state *state, const xair_op_view *op_view) {
+    xair_op_view op = *op_view; xair_type out; xair_sym_expr_id args[3]; xair_sym_expr_id result;
     xair_sym_taint_id result_taint = XAIR_SYM_TAINT_NONE; xair_sym_status status; size_t i;
-    if (xair_module_get_op(state->module, id, &op) != XAIR_OK) return XAIR_SYM_ERR_BAD_ARG;
     out = xair_value_type(state->module, op.dst);
     if (op.opcode == XAIR_OP_CONST_U64) { status = xair_sym_const(state->context, out.bits, op.immediate, &result); }
     else if (op.opcode == XAIR_OP_LOAD || op.opcode == XAIR_OP_STORE) return execute_memory(state, &op, out);
@@ -177,6 +176,12 @@ static xair_sym_status execute_op(xair_sym_state *state, xair_op_id id) {
         if (status != XAIR_SYM_OK) return status;
     }
     return xair_sym_state_set_taint(state, op.dst, result_taint);
+}
+
+static xair_sym_status execute_op(xair_sym_state *state, xair_op_id id) {
+    xair_op_view op;
+    if (xair_module_get_op(state->module, id, &op) != XAIR_OK) return XAIR_SYM_ERR_BAD_ARG;
+    return execute_op_view(state, &op);
 }
 
 static xair_sym_status transfer(xair_sym_state *state, xair_block_id target, const xair_value_id *args, size_t count) {
@@ -310,6 +315,7 @@ void xair_sym_explore_options_init(xair_sym_explore_options *options) {
     options->max_symbolic_forks = SIZE_MAX;
     options->search = XAIR_SYM_SEARCH_COVERAGE;
     options->execution_mode = XAIR_SYM_EXEC_SYMBOLIC;
+    options->cancel_token = NULL;
 }
 
 xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xair_sym_explore_options *options,
@@ -334,7 +340,8 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
     if (status != XAIR_SYM_OK) { xair_sym_state_destroy(state); free(visits); return status; }
     state = NULL;
     while (processed < options->max_states && steps < options->max_block_steps) {
-        const xair_op_id *ops; size_t op_count, i; xair_term_view term;
+        const xair_op_id *ops = NULL; size_t op_count, i; xair_term_view term;
+        if (xair_sym_cancel_token_requested(options->cancel_token)) break;
         state = dequeue(queue, queued, &cursor, options->search, visits);
         if (state == NULL) break;
         processed++;
@@ -353,9 +360,20 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
             state = NULL;
             continue;
         }
-        steps++; if (xair_block_ops(state->module, state->block, &ops, &op_count) != XAIR_OK) { status = XAIR_SYM_ERR_BAD_ARG; goto fail; }
-        for (i = 0; i < op_count; ++i) { status = execute_op(state, ops[i]); if (status != XAIR_SYM_OK) goto fail; }
-        if (xair_block_terminator(state->module, state->block, &term) != XAIR_OK) { status = XAIR_SYM_ERR_BAD_ARG; goto fail; }
+        steps++;
+        if (state->program != NULL) {
+            const xair_sym_compiled_block *compiled;
+            if (state->block >= state->program->block_count) { status = XAIR_SYM_ERR_BAD_ARG; goto fail; }
+            compiled = &state->program->blocks[state->block];
+            op_count = compiled->op_count;
+            for (i = 0; i < op_count; ++i) { status = execute_op_view(state, &compiled->ops[i]); if (status != XAIR_SYM_OK) goto fail; }
+            term = compiled->terminator;
+            state->context->stats.compiled_dispatches++;
+        } else {
+            if (xair_block_ops(state->module, state->block, &ops, &op_count) != XAIR_OK) { status = XAIR_SYM_ERR_BAD_ARG; goto fail; }
+            for (i = 0; i < op_count; ++i) { status = execute_op(state, ops[i]); if (status != XAIR_SYM_OK) goto fail; }
+            if (xair_block_terminator(state->module, state->block, &term) != XAIR_OK) { status = XAIR_SYM_ERR_BAD_ARG; goto fail; }
+        }
         if (term.kind == XAIR_TERM_VIEW_JUMP) {
             status = transfer(state, term.true_target, term.true_args, term.true_arg_count);
             if (status != XAIR_SYM_OK) goto fail;
