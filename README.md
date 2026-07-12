@@ -4,7 +4,7 @@ XAIR Symbolic is a C library for symbolic execution and object-based symbolic
 memory over frozen XAIR modules and XAIR CFGs. It is a separate project from the
 IR generator and CFG recovery engine and consumes their public C APIs.
 
-Current version: 0.1.0, Block B bootstrap.
+Current version: 0.2.0. Blocks A through C are complete.
 
 Implemented:
 
@@ -22,6 +22,16 @@ Implemented:
   encoded as guarded value summaries with explicit in-bounds constraints.
 - Deterministic counters for expressions, solver activity, states, forks, and
   memory copies.
+- Interned source, union, and named sanitizer provenance nodes.
+- Value and object-byte taint shadows that follow copy-on-write state memory.
+- Explicit and targeted implicit-flow propagation modes.
+- Read-only provenance inspection for source-to-sink explanations.
+- Breadth-first, depth-first, and coverage-new frontier policies.
+- Per-run state, block-step, and block-visit resource budgets.
+- Exact duplicate-state subsumption at the scheduler boundary.
+- Conservative dependency slicing before solver submission.
+- Collision-safe SAT, UNSAT, and model caches keyed by persistent constraint
+  identities and exact query objectives.
 
 The production implementation and public API are C. There is no Python runtime
 or Python orchestration layer. Z3 is an external solver dependency used through

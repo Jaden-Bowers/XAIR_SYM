@@ -111,6 +111,15 @@ xair_sym_status xair_sym_intern(xair_sym_context *context, const xair_sym_expr *
     }
     candidate = *key;
     candidate.hash = expr_hash(&candidate);
+    candidate.dependencies = 0;
+    if (candidate.kind == XAIR_SYM_EXPR_SYMBOL) {
+        candidate.dependencies = UINT64_C(1) << (candidate.hash & 63u);
+    } else if (candidate.kind == XAIR_SYM_EXPR_XAIR) {
+        size_t dependency_i;
+        for (dependency_i = 0; dependency_i < candidate.arg_count; ++dependency_i) {
+            candidate.dependencies |= context->expressions[candidate.args[dependency_i]]->dependencies;
+        }
+    }
     if (context->hash_capacity == 0 || (context->hash_count + 1) * 10 >= context->hash_capacity * 7) {
         size_t next = context->hash_capacity == 0 ? 32 : context->hash_capacity * 2;
         status = rebuild_hash(context, next);
@@ -165,7 +174,12 @@ xair_sym_status xair_sym_context_create(xair_sym_context **out_context) {
 void xair_sym_context_destroy(xair_sym_context *context) {
     if (context != NULL) {
         xair_sym_arena_chunk *chunk = context->arena;
+        size_t taint_i;
         while (chunk != NULL) { xair_sym_arena_chunk *next = chunk->next; free(chunk); chunk = next; }
+        for (taint_i = 0; taint_i < context->taint_count; ++taint_i) free(context->taints[taint_i]);
+        free(context->taints);
+        free(context->query_cache);
+        free(context->model_cache);
         free(context->hash);
         free(context->expressions);
         free(context);

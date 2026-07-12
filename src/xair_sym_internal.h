@@ -11,6 +11,7 @@ typedef struct {
     xair_sym_expr_id args[3];
     uint64_t immediate;
     uint64_t hash;
+    uint64_t dependencies;
     char symbol[48];
 } xair_sym_expr;
 
@@ -19,6 +20,28 @@ typedef struct {
     xair_sym_expr_id expr;
     uint8_t used;
 } xair_sym_hash_entry;
+
+typedef struct {
+    xair_sym_taint_node_kind kind;
+    xair_sym_taint_id lhs;
+    xair_sym_taint_id rhs;
+    uint64_t hash;
+    char name[48];
+} xair_sym_taint_node;
+
+typedef struct {
+    uint64_t key;
+    uint64_t constraint_identity;
+    xair_sym_expr_id extra;
+    xair_sym_sat result;
+    uint8_t used;
+} xair_sym_query_cache_entry;
+
+typedef struct {
+    uint64_t constraint_identity;
+    xair_sym_expr_id symbol;
+    uint64_t value;
+} xair_sym_model_cache_entry;
 
 typedef struct xair_sym_arena_chunk {
     struct xair_sym_arena_chunk *next;
@@ -32,6 +55,7 @@ typedef struct {
     size_t size;
     uint32_t permissions;
     xair_sym_expr_id *bytes;
+    xair_sym_taint_id *taints;
 } xair_sym_object;
 
 typedef struct xair_sym_memory {
@@ -44,6 +68,7 @@ typedef struct xair_sym_memory {
 typedef struct xair_sym_constraint {
     size_t refs;
     size_t count;
+    uint64_t identity;
     xair_sym_expr_id expression;
     struct xair_sym_constraint *parent;
 } xair_sym_constraint;
@@ -57,6 +82,17 @@ struct xair_sym_context {
     size_t hash_capacity;
     xair_sym_arena_chunk *arena;
     xair_sym_stats stats;
+    xair_sym_taint_node **taints;
+    size_t taint_count;
+    size_t taint_capacity;
+    xair_sym_taint_mode taint_mode;
+    xair_sym_query_cache_entry *query_cache;
+    size_t query_cache_count;
+    size_t query_cache_capacity;
+    uint64_t next_constraint_identity;
+    xair_sym_model_cache_entry *model_cache;
+    size_t model_cache_count;
+    size_t model_cache_capacity;
 };
 
 struct xair_sym_state {
@@ -65,9 +101,12 @@ struct xair_sym_state {
     xair_block_id block;
     xair_sym_expr_id *values;
     uint8_t *defined;
+    xair_sym_taint_id *value_taints;
     size_t value_count;
     xair_sym_constraint *constraints;
     xair_sym_memory *memory;
+    size_t depth;
+    xair_sym_taint_id control_taint;
 };
 
 xair_sym_status xair_sym_intern(xair_sym_context *context, const xair_sym_expr *key, xair_sym_expr_id *out_expr);
@@ -79,8 +118,13 @@ xair_sym_status xair_sym_memory_load_symbolic8(
     xair_sym_state *state, xair_sym_expr_id address, xair_sym_expr_id *out_value);
 xair_sym_status xair_sym_memory_store_symbolic8(
     xair_sym_state *state, xair_sym_expr_id address, xair_sym_expr_id value);
+xair_sym_status xair_sym_memory_union_taint(
+    xair_sym_state *state, uint32_t permission, xair_sym_taint_id taint,
+    int update, xair_sym_taint_id *out_taint);
 xair_sym_status xair_sym_solver_check(
     xair_sym_state *state, xair_sym_expr_id extra, xair_sym_sat *out_sat,
     xair_sym_expr_id model_symbol, uint64_t *out_model);
+xair_sym_status xair_sym_taint_operands(
+    xair_sym_state *state, const xair_op_view *op, xair_sym_taint_id *out_taint);
 
 #endif

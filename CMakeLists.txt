@@ -16,6 +16,7 @@ find_library(XAIR_SYM_Z3_LIBRARY NAMES z3 libz3 HINTS ${XAIR_SYM_Z3_ROOT}/lib RE
 add_library(xair_sym STATIC
     src/xair_sym_core.c
     src/xair_sym_memory.c
+    src/xair_sym_taint.c
     src/xair_sym_solver_z3.c
     src/xair_sym_exec.c
 )
