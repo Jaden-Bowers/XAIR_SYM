@@ -109,11 +109,27 @@ struct xair_sym_state {
     xair_sym_taint_id control_taint;
 };
 
+struct xair_sym_trace {
+    xair_sym_trace_branch *branches;
+    size_t count;
+    size_t capacity;
+};
+
+struct xair_sym_environment {
+    xair_sym_context *context;
+    xair_arch arch;
+    uint64_t heap_next;
+    uint64_t stack_base;
+    size_t stack_size;
+};
+
 xair_sym_status xair_sym_intern(xair_sym_context *context, const xair_sym_expr *key, xair_sym_expr_id *out_expr);
 xair_sym_memory *xair_sym_memory_create(void);
 void xair_sym_memory_retain(xair_sym_memory *memory);
 void xair_sym_memory_release(xair_sym_memory *memory);
 xair_sym_status xair_sym_memory_make_unique(xair_sym_state *state);
+xair_sym_status xair_sym_memory_initialize8(
+    xair_sym_state *state, uint64_t address, xair_sym_expr_id value);
 xair_sym_status xair_sym_memory_load_symbolic8(
     xair_sym_state *state, xair_sym_expr_id address, xair_sym_expr_id *out_value);
 xair_sym_status xair_sym_memory_store_symbolic8(

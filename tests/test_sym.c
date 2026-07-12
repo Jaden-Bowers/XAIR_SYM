@@ -81,6 +81,7 @@ static void test_symbolic_address_resolves_inside_object(void) {
 static void test_symbolic_xair_branch_explores_both_paths(void) {
     xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL;
     xair_block_id entry, low, high; xair_value_id x, ten, condition; xair_sym_expr_id symbol; terminal_counts counts;
+    xair_sym_explore_options options; xair_sym_stats stats;
     memset(&counts, 0, sizeof(counts)); require_xair(xair_module_create(&module));
     require_xair(xair_block_create(module, "entry", &entry)); require_xair(xair_block_create(module, "low", &low)); require_xair(xair_block_create(module, "high", &high));
     require_xair(xair_block_add_param(module, entry, xair_type_i(8), "x", &x));
@@ -92,6 +93,11 @@ static void test_symbolic_xair_branch_explores_both_paths(void) {
     require_sym(xair_sym_symbol(context, 8, "input", &symbol)); require_sym(xair_sym_state_set_value(state, x, symbol));
     require_sym(xair_sym_explore(state, 16, 16, count_terminal, &counts));
     assert(counts.count == 2); assert(counts.seen_true && counts.seen_false);
+    memset(&counts, 0, sizeof(counts)); xair_sym_explore_options_init(&options);
+    options.execution_mode = XAIR_SYM_EXEC_HYBRID_CONCRETIZE; options.max_symbolic_forks = 0;
+    options.max_states = 8; options.max_block_steps = 8;
+    require_sym(xair_sym_explore_with_options(state, &options, count_terminal, &counts)); assert(counts.count == 1);
+    xair_sym_context_stats(context, &stats); assert(stats.concretizations == 1);
     xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
 }
 
@@ -285,6 +291,60 @@ static void test_dfs_policy_and_loop_budget(void) {
     xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
 }
 
+static void test_concolic_inversion_and_testcase_exchange(void) {
+    xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *base = NULL; xair_sym_state *inverted = NULL;
+    xair_sym_trace *trace = NULL; xair_block_id block; xair_value_id value; xair_sym_expr_id x, answer, condition;
+    uint64_t model; uint8_t generated[1], loaded[1]; size_t loaded_size; const char *path = "xair_sym_testcase.bin";
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &block));
+    require_xair(xair_block_add_param(module, block, xair_type_i(8), "value", &value)); require_xair(xair_set_return(module, block, &value, 1));
+    require_sym(xair_sym_context_create(&context)); require_sym(xair_sym_state_create(context, module, block, &base));
+    require_sym(xair_sym_symbol(context, 8, "concolic_x", &x)); require_sym(xair_sym_const(context, 8, 42, &answer));
+    require_sym(xair_sym_binary(context, XAIR_OP_EQ, 1, x, answer, &condition)); require_sym(xair_sym_trace_create(&trace));
+    require_sym(xair_sym_trace_add_branch(trace, block, condition, 0)); assert(xair_sym_trace_count(trace) == 1);
+    require_sym(xair_sym_concolic_invert(base, trace, 0, &inverted)); require_sym(xair_sym_model_u64(inverted, x, &model)); assert(model == 42);
+    require_sym(xair_sym_model_bytes(inverted, &x, 1, generated)); assert(generated[0] == 42);
+    remove(path); require_sym(xair_sym_testcase_write(path, generated, sizeof(generated)));
+    require_sym(xair_sym_testcase_read(path, loaded, sizeof(loaded), &loaded_size)); remove(path);
+    assert(loaded_size == 1 && loaded[0] == 42);
+    xair_sym_state_destroy(inverted); xair_sym_trace_destroy(trace); xair_sym_state_destroy(base);
+    xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
+static void test_process_environment_and_models(void) {
+    static uint8_t code[] = {
+        0x48, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xc3
+    };
+    xair_binary_segment segment; xair_binary_view binary; xair_cfg_options cfg_options; xair_cfg_builder *builder = NULL;
+    xair_cfg *cfg = NULL; xair_cfg_stats cfg_stats; xair_error error; xair_sym_context *context = NULL;
+    xair_sym_environment *environment = NULL; xair_sym_state *state = NULL; xair_sym_process_options process_options;
+    xair_sym_expr_id code_byte, symbols[4], copied; xair_sym_taint_id source_taint, copied_taint;
+    xair_sym_model_kind kind; xair_sym_model_info model_info; uint64_t input_buffer, copy_buffer;
+    memset(&segment, 0, sizeof(segment)); segment.va = 0x1000; segment.mem_size = sizeof(code);
+    segment.file_size = sizeof(code); segment.perms = XAIR_BINARY_PERM_READ | XAIR_BINARY_PERM_EXEC; segment.bytes = code;
+    memset(&binary, 0, sizeof(binary)); binary.format = XAIR_BINARY_FORMAT_ELF; binary.arch = XAIR_ARCH_X86_64;
+    binary.entry = 0x1000; binary.image_base = 0x1000; binary.segments = &segment; binary.segment_count = 1;
+    xair_cfg_options_init(&cfg_options, XAIR_CFG_PROFILE_BALANCED); cfg_options.entry = binary.entry;
+    require_xair(xair_cfg_builder_create(&binary, &cfg_options, &builder)); require_xair(xair_cfg_add_root(builder, binary.entry));
+    require_xair(xair_cfg_build(builder, &cfg, &cfg_stats, &error)); xair_cfg_builder_destroy(builder);
+    require_sym(xair_sym_context_create(&context)); xair_sym_process_options_init(&process_options, binary.arch);
+    process_options.stack_size = 4096; process_options.max_segment_size = 4096;
+    require_sym(xair_sym_process_create(context, cfg, &binary, &process_options, &environment, &state));
+    require_sym(xair_sym_memory_load8(state, 0x1000, &code_byte));
+    require_sym(xair_sym_environment_model(environment, "read", &kind)); assert(kind == XAIR_SYM_MODEL_INPUT);
+    require_sym(xair_sym_environment_model(environment, "ExAllocatePoolWithTag", &kind)); assert(kind == XAIR_SYM_MODEL_ALLOC);
+    require_sym(xair_sym_environment_model_info(environment, "ProbeForRead", &model_info));
+    assert(model_info.kind == XAIR_SYM_MODEL_DRIVER_INPUT && model_info.version_major == 1);
+    require_sym(xair_sym_environment_allocate(environment, state, 16, &input_buffer));
+    require_sym(xair_sym_environment_allocate(environment, state, 16, &copy_buffer));
+    require_sym(xair_sym_environment_input(environment, state, input_buffer, 4, "network", symbols));
+    require_sym(xair_sym_environment_copy(environment, state, copy_buffer, input_buffer, 4));
+    require_sym(xair_sym_memory_load8(state, copy_buffer + 2, &copied)); assert(copied == symbols[2]);
+    require_sym(xair_sym_memory_load_taint8(state, input_buffer, &source_taint));
+    require_sym(xair_sym_memory_load_taint8(state, copy_buffer + 2, &copied_taint)); assert(copied_taint == source_taint);
+    xair_sym_state_destroy(state); xair_sym_environment_destroy(environment); xair_sym_context_destroy(context); xair_cfg_destroy(cfg);
+}
+
 int main(void) {
     test_expression_interning_and_z3_model();
     test_symbolic_xair_branch_explores_both_paths();
@@ -297,5 +357,7 @@ int main(void) {
     test_strict_implicit_branch_taint();
     test_constraint_slicing_and_exact_query_cache();
     test_dfs_policy_and_loop_budget();
+    test_concolic_inversion_and_testcase_exchange();
+    test_process_environment_and_models();
     return 0;
 }

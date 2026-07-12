@@ -9,7 +9,7 @@ extern "C" {
 
 #define XAIR_SYM_INVALID_ID UINT32_MAX
 #define XAIR_SYM_VERSION_MAJOR 0u
-#define XAIR_SYM_VERSION_MINOR 2u
+#define XAIR_SYM_VERSION_MINOR 3u
 #define XAIR_SYM_VERSION_PATCH 0u
 
 typedef uint32_t xair_sym_expr_id;
@@ -70,6 +70,7 @@ typedef struct {
     size_t constraints_submitted;
     size_t constraints_sliced;
     size_t scheduler_pruned;
+    size_t concretizations;
 } xair_sym_stats;
 
 typedef enum {
@@ -97,15 +98,55 @@ typedef enum {
     XAIR_SYM_SEARCH_COVERAGE
 } xair_sym_search_policy;
 
+typedef enum {
+    XAIR_SYM_EXEC_SYMBOLIC = 0,
+    XAIR_SYM_EXEC_HYBRID_CONCRETIZE
+} xair_sym_execution_mode;
+
 typedef struct {
     size_t max_states;
     size_t max_block_steps;
     size_t max_visits_per_block;
+    size_t max_symbolic_forks;
     xair_sym_search_policy search;
+    xair_sym_execution_mode execution_mode;
 } xair_sym_explore_options;
 
 typedef struct xair_sym_context xair_sym_context;
 typedef struct xair_sym_state xair_sym_state;
+typedef struct xair_sym_trace xair_sym_trace;
+typedef struct xair_sym_environment xair_sym_environment;
+
+typedef struct {
+    xair_block_id block;
+    xair_sym_expr_id condition;
+    uint8_t taken;
+} xair_sym_trace_branch;
+
+typedef struct {
+    uint64_t stack_base;
+    size_t stack_size;
+    size_t max_segment_size;
+} xair_sym_process_options;
+
+typedef enum {
+    XAIR_SYM_MODEL_UNKNOWN = 0,
+    XAIR_SYM_MODEL_ALLOC,
+    XAIR_SYM_MODEL_FREE,
+    XAIR_SYM_MODEL_COPY,
+    XAIR_SYM_MODEL_FILL,
+    XAIR_SYM_MODEL_INPUT,
+    XAIR_SYM_MODEL_LENGTH,
+    XAIR_SYM_MODEL_NO_RETURN,
+    XAIR_SYM_MODEL_DRIVER_INPUT,
+    XAIR_SYM_MODEL_DRIVER_COMPLETE
+} xair_sym_model_kind;
+
+typedef struct {
+    xair_sym_model_kind kind;
+    uint16_t version_major;
+    uint16_t version_minor;
+} xair_sym_model_info;
 
 xair_sym_status xair_sym_context_create(xair_sym_context **out_context);
 void xair_sym_context_destroy(xair_sym_context *context);
@@ -171,6 +212,52 @@ xair_sym_status xair_sym_check(
     xair_sym_state *state, xair_sym_expr_id extra_condition, xair_sym_sat *out_sat);
 xair_sym_status xair_sym_model_u64(
     xair_sym_state *state, xair_sym_expr_id symbol, uint64_t *out_value);
+xair_sym_status xair_sym_model_bytes(
+    xair_sym_state *state, const xair_sym_expr_id *symbols, size_t count,
+    uint8_t *out_bytes);
+xair_sym_status xair_sym_state_concretize(
+    xair_sym_state *state, xair_sym_expr_id expression,
+    xair_sym_expr_id *out_constant);
+
+xair_sym_status xair_sym_trace_create(xair_sym_trace **out_trace);
+void xair_sym_trace_destroy(xair_sym_trace *trace);
+xair_sym_status xair_sym_trace_add_branch(
+    xair_sym_trace *trace, xair_block_id block,
+    xair_sym_expr_id condition, int taken);
+size_t xair_sym_trace_count(const xair_sym_trace *trace);
+xair_sym_status xair_sym_trace_get(
+    const xair_sym_trace *trace, size_t index,
+    xair_sym_trace_branch *out_branch);
+xair_sym_status xair_sym_concolic_invert(
+    const xair_sym_state *base, const xair_sym_trace *trace,
+    size_t branch_index, xair_sym_state **out_state);
+xair_sym_status xair_sym_testcase_write(
+    const char *path, const uint8_t *bytes, size_t size);
+xair_sym_status xair_sym_testcase_read(
+    const char *path, uint8_t *bytes, size_t capacity, size_t *out_size);
+
+void xair_sym_process_options_init(xair_sym_process_options *options, xair_arch arch);
+xair_sym_status xair_sym_process_create(
+    xair_sym_context *context, const xair_cfg *cfg,
+    const xair_binary_view *binary, const xair_sym_process_options *options,
+    xair_sym_environment **out_environment, xair_sym_state **out_state);
+void xair_sym_environment_destroy(xair_sym_environment *environment);
+xair_sym_status xair_sym_environment_model(
+    const xair_sym_environment *environment, const char *name,
+    xair_sym_model_kind *out_kind);
+xair_sym_status xair_sym_environment_model_info(
+    const xair_sym_environment *environment, const char *name,
+    xair_sym_model_info *out_info);
+xair_sym_status xair_sym_environment_allocate(
+    xair_sym_environment *environment, xair_sym_state *state,
+    size_t size, uint64_t *out_address);
+xair_sym_status xair_sym_environment_input(
+    xair_sym_environment *environment, xair_sym_state *state,
+    uint64_t address, size_t size, const char *source_name,
+    xair_sym_expr_id *out_symbols);
+xair_sym_status xair_sym_environment_copy(
+    xair_sym_environment *environment, xair_sym_state *state,
+    uint64_t destination, uint64_t source, size_t size);
 
 typedef xair_sym_status (*xair_sym_terminal_cb)(xair_sym_state *state, void *user);
 xair_sym_status xair_sym_explore(

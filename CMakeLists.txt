@@ -17,6 +17,8 @@ add_library(xair_sym STATIC
     src/xair_sym_core.c
     src/xair_sym_memory.c
     src/xair_sym_taint.c
+    src/xair_sym_concolic.c
+    src/xair_sym_environment.c
     src/xair_sym_solver_z3.c
     src/xair_sym_exec.c
 )

@@ -307,13 +307,15 @@ void xair_sym_explore_options_init(xair_sym_explore_options *options) {
     options->max_states = 100000;
     options->max_block_steps = 1000000;
     options->max_visits_per_block = 1024;
+    options->max_symbolic_forks = SIZE_MAX;
     options->search = XAIR_SYM_SEARCH_COVERAGE;
+    options->execution_mode = XAIR_SYM_EXEC_SYMBOLIC;
 }
 
 xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xair_sym_explore_options *options,
     xair_sym_terminal_cb callback, void *user) {
     xair_sym_state **queue = NULL;
-    size_t queued = 0, capacity = 0, cursor = 0, steps = 0, processed = 0;
+    size_t queued = 0, capacity = 0, cursor = 0, steps = 0, processed = 0, symbolic_forks = 0;
     size_t *visits = NULL;
     xair_sym_seen_state *seen_states = NULL;
     size_t seen_count = 0, seen_capacity = 0;
@@ -321,7 +323,8 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
     xair_sym_state *state = NULL;
     xair_sym_status status;
     if (initial == NULL || options == NULL || options->max_states == 0 || options->max_block_steps == 0 ||
-        options->max_visits_per_block == 0 || options->search > XAIR_SYM_SEARCH_COVERAGE) return XAIR_SYM_ERR_BAD_ARG;
+        options->max_visits_per_block == 0 || options->search > XAIR_SYM_SEARCH_COVERAGE ||
+        options->execution_mode > XAIR_SYM_EXEC_HYBRID_CONCRETIZE) return XAIR_SYM_ERR_BAD_ARG;
     block_count = xair_module_block_count(initial->module);
     visits = (size_t *)calloc(block_count != 0 ? block_count : 1, sizeof(*visits));
     if (visits == NULL) return XAIR_SYM_ERR_OOM;
@@ -366,7 +369,27 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
             status = xair_sym_state_get_value(state, term.condition, &condition); if (status != XAIR_SYM_OK) goto fail;
             status = xair_sym_const(state->context, 1, 0, &zero); if (status != XAIR_SYM_OK) goto fail;
             status = xair_sym_binary(state->context, XAIR_OP_EQ, 1, condition, zero, &negated); if (status != XAIR_SYM_OK) goto fail;
+            if (options->execution_mode == XAIR_SYM_EXEC_HYBRID_CONCRETIZE && symbolic_forks >= options->max_symbolic_forks) {
+                uint64_t concrete;
+                int take_true;
+                xair_sym_expr_id chosen;
+                status = xair_sym_model_u64(state, condition, &concrete);
+                if (status != XAIR_SYM_OK) goto fail;
+                take_true = (concrete & 1u) != 0;
+                chosen = take_true ? condition : negated;
+                status = xair_sym_state_assume(state, chosen);
+                if (status == XAIR_SYM_OK) status = transfer(state,
+                    take_true ? term.true_target : term.false_target,
+                    take_true ? term.true_args : term.false_args,
+                    take_true ? term.true_arg_count : term.false_arg_count);
+                if (status == XAIR_SYM_OK) status = enqueue(&queue, &queued, &capacity, state);
+                if (status != XAIR_SYM_OK) goto fail;
+                state->context->stats.concretizations++;
+                state = NULL;
+                continue;
+            }
             status = xair_sym_state_clone(state, &false_state); if (status != XAIR_SYM_OK) goto fail; state->context->stats.forks++;
+            symbolic_forks++;
             if (state->context->taint_mode == XAIR_SYM_TAINT_STRICT_IMPLICIT) {
                 xair_sym_taint_id branch_taint = state->value_taints[term.condition];
                 status = xair_sym_taint_union(state->context, state->control_taint, branch_taint, &state->control_taint);

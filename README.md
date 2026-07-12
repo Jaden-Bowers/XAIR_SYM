@@ -4,7 +4,7 @@ XAIR Symbolic is a C library for symbolic execution and object-based symbolic
 memory over frozen XAIR modules and XAIR CFGs. It is a separate project from the
 IR generator and CFG recovery engine and consumes their public C APIs.
 
-Current version: 0.2.0. Blocks A through C are complete.
+Current version: 0.3.0. Blocks A through D are complete.
 
 Implemented:
 
@@ -32,6 +32,17 @@ Implemented:
 - Conservative dependency slicing before solver submission.
 - Collision-safe SAT, UNSAT, and model caches keyed by persistent constraint
   identities and exact query objectives.
+- Concrete branch-trace ingestion and targeted branch inversion.
+- Feasible model extraction as byte-oriented fuzzer inputs.
+- Versioned binary testcase exchange with bounded C readers and writers.
+- Hybrid execution controls that cap online forks and record concretization.
+- PE32, PE32+, ELF32, and ELF64 process-memory initialization through the
+  upstream binary and CFG contracts.
+- Architecture-specific stack initialization and symbolic initial registers.
+- Deterministic heap objects, symbolic input buffers, taint sources, and
+  provenance-preserving memory copies.
+- Versioned Linux, Windows, and Windows-driver model classification for common
+  allocation, input, copy, termination, probing, and completion APIs.
 
 The production implementation and public API are C. There is no Python runtime
 or Python orchestration layer. Z3 is an external solver dependency used through
@@ -41,6 +52,13 @@ The current memory bootstrap resolves concrete addresses directly and bounded
 symbolic byte addresses through guarded object-byte summaries. Wide symbolic
 accesses and scalable index representations belong to later optimization work.
 Unsupported semantic forms return an explicit status.
+
+The process model maps the binary segments supplied by `xair_binary_view`, then
+adds a deterministic stack and initializes entry parameters by their frozen IR
+names. Relocation application, dynamic linking, command-line construction,
+filesystem state, and full kernel object graphs remain explicit later
+environment work. Unknown external calls are reported as unknown models rather
+than being assigned unconstrained behavior silently.
 
 ## Build
 
