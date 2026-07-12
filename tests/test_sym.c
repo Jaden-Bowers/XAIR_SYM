@@ -13,10 +13,14 @@ static void require_xair(xair_status status) { assert(status == XAIR_OK); }
 
 static void test_expression_interning_and_z3_model(void) {
     xair_sym_context *context = NULL; xair_module *module = NULL; xair_sym_state *state = NULL;
-    xair_block_id block; xair_value_id value; xair_sym_expr_id x, one, sum0, sum1, answer, condition;
+    xair_exec_state *concrete_state = NULL; xair_exec_result concrete_result;
+    xair_block_id block; xair_value_id value, one_value, sum_value; xair_sym_expr_id x, one, sum0, sum1, answer, condition;
     xair_sym_sat sat; uint64_t model; xair_sym_stats stats;
     require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &block));
-    require_xair(xair_block_add_param(module, block, xair_type_i(8), "value", &value)); require_xair(xair_set_return(module, block, &value, 1));
+    require_xair(xair_block_add_param(module, block, xair_type_i(8), "value", &value));
+    require_xair(xair_build_const_u64(module, block, xair_type_i(8), 1, "one", &one_value));
+    require_xair(xair_build_binary(module, block, XAIR_OP_ADD, xair_type_i(8), value, one_value, "sum", &sum_value));
+    require_xair(xair_set_return(module, block, &sum_value, 1));
     require_sym(xair_sym_context_create(&context)); require_sym(xair_sym_state_create(context, module, block, &state));
     require_sym(xair_sym_symbol(context, 8, "x", &x)); require_sym(xair_sym_const(context, 8, 1, &one));
     require_sym(xair_sym_binary(context, XAIR_OP_ADD, 8, x, one, &sum0));
@@ -24,8 +28,13 @@ static void test_expression_interning_and_z3_model(void) {
     require_sym(xair_sym_const(context, 8, 42, &answer)); require_sym(xair_sym_binary(context, XAIR_OP_EQ, 1, sum0, answer, &condition));
     require_sym(xair_sym_state_assume(state, condition)); require_sym(xair_sym_check(state, XAIR_SYM_INVALID_ID, &sat)); assert(sat == XAIR_SYM_SAT);
     require_sym(xair_sym_model_u64(state, x, &model)); assert(model == 41);
+    require_xair(xair_exec_state_create(module, &concrete_state));
+    require_xair(xair_exec_set_param(concrete_state, value, xair_exec_i(8, model)));
+    require_xair(xair_exec_run(module, block, concrete_state, 4, &concrete_result));
+    assert(concrete_result.kind == XAIR_EXEC_HALTED_RETURN);
+    assert(concrete_result.return_count == 1 && concrete_result.returns[0].lo == 42);
     xair_sym_context_stats(context, &stats); assert(stats.expressions_reused >= 1); assert(stats.solver_queries == 2);
-    xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
+    xair_exec_state_destroy(concrete_state); xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
 }
 
 typedef struct { size_t count; unsigned seen_true; unsigned seen_false; } terminal_counts;
