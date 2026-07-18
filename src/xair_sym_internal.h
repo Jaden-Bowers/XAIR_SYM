@@ -110,6 +110,7 @@ struct xair_sym_state {
     size_t depth;
     xair_sym_taint_id control_taint;
     const xair_sym_program *program;
+    xair_sym_execution_mode execution_mode;
 };
 
 typedef struct {

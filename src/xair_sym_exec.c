@@ -1,6 +1,7 @@
 #include "xair_sym_internal.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 static void constraint_retain(xair_sym_constraint *constraint) {
@@ -89,6 +90,61 @@ static xair_sym_status expression_constant(const xair_sym_state *state, xair_sym
     *out = state->context->expressions[id]->immediate; return XAIR_SYM_OK;
 }
 
+static xair_sym_status offset_symbolic_address(
+    xair_sym_state *state,
+    xair_sym_expr_id address_expr,
+    size_t offset,
+    xair_sym_expr_id *out_address) {
+    uint16_t bits;
+    xair_sym_expr_id delta;
+    xair_sym_status status;
+
+    if (state == NULL || out_address == NULL || address_expr >= state->context->expression_count) {
+        return XAIR_SYM_ERR_BAD_ARG;
+    }
+    if (offset == 0u) {
+        *out_address = address_expr;
+        return XAIR_SYM_OK;
+    }
+    bits = state->context->expressions[address_expr]->bits;
+    status = xair_sym_const(state->context, bits, (uint64_t)offset, &delta);
+    if (status != XAIR_SYM_OK) {
+        return status;
+    }
+    return xair_sym_binary(state->context, XAIR_OP_ADD, bits, address_expr, delta, out_address);
+}
+
+static xair_sym_status concretize_memory_address(
+    xair_sym_state *state,
+    xair_sym_expr_id address_expr,
+    uint64_t *out_address) {
+    xair_sym_expr_id concrete_expr;
+    xair_sym_expr_id assumed;
+    xair_sym_status status;
+
+    if (state == NULL || out_address == NULL) {
+        return XAIR_SYM_ERR_BAD_ARG;
+    }
+    status = xair_sym_state_concretize(state, address_expr, &concrete_expr);
+    if (status != XAIR_SYM_OK) {
+        return status;
+    }
+    status = xair_sym_binary(state->context, XAIR_OP_EQ, 1, address_expr, concrete_expr, &assumed);
+    if (status != XAIR_SYM_OK) {
+        return status;
+    }
+    status = xair_sym_state_assume(state, assumed);
+    if (status != XAIR_SYM_OK) {
+        return status;
+    }
+    status = expression_constant(state, concrete_expr, out_address);
+    if (status != XAIR_SYM_OK) {
+        return status;
+    }
+    state->context->stats.concretizations++;
+    return XAIR_SYM_OK;
+}
+
 static xair_sym_status execute_memory(xair_sym_state *state, const xair_op_view *op, xair_type out_type) {
     xair_sym_expr_id address_expr; uint64_t address; size_t bytes; size_t i; int address_is_concrete;
     xair_sym_taint_id memory_taint = XAIR_SYM_TAINT_NONE; xair_sym_status status;
@@ -98,6 +154,11 @@ static xair_sym_status execute_memory(xair_sym_state *state, const xair_op_view 
     if (op->opcode == XAIR_OP_LOAD) {
         xair_sym_expr_id result = XAIR_SYM_INVALID_ID;
         bytes = out_type.bits / 8u; if (out_type.bits == 0 || out_type.bits > 64 || out_type.bits % 8u != 0) return XAIR_SYM_ERR_UNSUPPORTED;
+        if (!address_is_concrete && bytes > 1u && state->execution_mode == XAIR_SYM_EXEC_HYBRID_CONCRETIZE) {
+            status = concretize_memory_address(state, address_expr, &address);
+            if (status != XAIR_SYM_OK) return status;
+            address_is_concrete = 1;
+        }
         for (i = 0; i < bytes; ++i) {
             xair_sym_expr_id byte;
             if (address_is_concrete) {
@@ -105,15 +166,19 @@ static xair_sym_status execute_memory(xair_sym_state *state, const xair_op_view 
                 status = xair_sym_memory_load8(state, address + i, &byte);
                 if (status == XAIR_SYM_OK) status = xair_sym_memory_load_taint8(state, address + i, &byte_taint);
                 if (status == XAIR_SYM_OK) status = xair_sym_taint_union(state->context, memory_taint, byte_taint, &memory_taint);
-            } else if (bytes == 1) {
-                status = xair_sym_memory_load_symbolic8(state, address_expr, &byte);
-                if (status == XAIR_SYM_OK) status = xair_sym_memory_union_taint(state, 1u, XAIR_SYM_TAINT_NONE, 0, &memory_taint);
+            } else {
+                xair_sym_expr_id byte_address;
+                status = offset_symbolic_address(state, address_expr, i, &byte_address);
+                if (status == XAIR_SYM_OK) status = xair_sym_memory_load_symbolic8(state, byte_address, &byte);
             }
-            else return XAIR_SYM_ERR_UNSUPPORTED;
             if (status != XAIR_SYM_OK) return status;
             if (result == XAIR_SYM_INVALID_ID) result = byte;
             else { xair_sym_expr_id joined; status = xair_sym_binary(state->context, XAIR_OP_CONCAT,
                 (uint16_t)((i + 1) * 8u), byte, result, &joined); if (status != XAIR_SYM_OK) return status; result = joined; }
+        }
+        if (!address_is_concrete) {
+            status = xair_sym_memory_union_taint(state, 1u, XAIR_SYM_TAINT_NONE, 0, &memory_taint);
+            if (status != XAIR_SYM_OK) return status;
         }
         status = xair_sym_state_set_value(state, op->dst, result);
         if (status != XAIR_SYM_OK) return status;
@@ -128,18 +193,27 @@ static xair_sym_status execute_memory(xair_sym_state *state, const xair_op_view 
         }
         status = xair_sym_state_get_value(state, op->src[2], &data); if (status != XAIR_SYM_OK) return status;
         bytes = type.bits / 8u; if (type.bits == 0 || type.bits > 64 || type.bits % 8u != 0) return XAIR_SYM_ERR_UNSUPPORTED;
+        if (!address_is_concrete && bytes > 1u && state->execution_mode == XAIR_SYM_EXEC_HYBRID_CONCRETIZE) {
+            status = concretize_memory_address(state, address_expr, &address);
+            if (status != XAIR_SYM_OK) return status;
+            address_is_concrete = 1;
+        }
         for (i = 0; i < bytes; ++i) {
             xair_sym_expr_id byte; status = xair_sym_unary(state->context, XAIR_OP_EXTRACT, 8, data, i * 8u, &byte);
             if (status != XAIR_SYM_OK) return status;
             if (address_is_concrete) {
                 status = xair_sym_memory_store8(state, address + i, byte);
                 if (status == XAIR_SYM_OK) status = xair_sym_memory_store_taint8(state, address + i, data_taint);
-            } else if (bytes == 1) {
-                xair_sym_taint_id ignored;
-                status = xair_sym_memory_store_symbolic8(state, address_expr, byte);
-                if (status == XAIR_SYM_OK) status = xair_sym_memory_union_taint(state, 2u, data_taint, 1, &ignored);
+            } else {
+                xair_sym_expr_id byte_address;
+                status = offset_symbolic_address(state, address_expr, i, &byte_address);
+                if (status == XAIR_SYM_OK) status = xair_sym_memory_store_symbolic8(state, byte_address, byte);
             }
-            else return XAIR_SYM_ERR_UNSUPPORTED;
+            if (status != XAIR_SYM_OK) return status;
+        }
+        if (!address_is_concrete) {
+            xair_sym_taint_id ignored;
+            status = xair_sym_memory_union_taint(state, 2u, data_taint, 1, &ignored);
             if (status != XAIR_SYM_OK) return status;
         }
         status = xair_sym_state_get_value(state, op->src[0], &data);
@@ -328,6 +402,11 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
     size_t block_count;
     xair_sym_state *state = NULL;
     xair_sym_status status;
+    xair_block_id trace_block = XAIR_INVALID_ID;
+    size_t trace_op_index = SIZE_MAX;
+    xair_opcode trace_opcode = XAIR_OP_ADD;
+    int trace_opcode_valid = 0;
+    uint8_t trace_in_terminator = 0u;
     if (initial == NULL || options == NULL || options->max_states == 0 || options->max_block_steps == 0 ||
         options->max_visits_per_block == 0 || options->search > XAIR_SYM_SEARCH_COVERAGE ||
         options->execution_mode > XAIR_SYM_EXEC_HYBRID_CONCRETIZE) return XAIR_SYM_ERR_BAD_ARG;
@@ -336,6 +415,7 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
     if (visits == NULL) return XAIR_SYM_ERR_OOM;
     status = xair_sym_state_clone(initial, &state);
     if (status != XAIR_SYM_OK) { free(visits); return status; }
+    state->execution_mode = options->execution_mode;
     status = enqueue(&queue, &queued, &capacity, state);
     if (status != XAIR_SYM_OK) { xair_sym_state_destroy(state); free(visits); return status; }
     state = NULL;
@@ -361,17 +441,40 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
             continue;
         }
         steps++;
+        trace_block = state->block;
+        trace_op_index = SIZE_MAX;
+        trace_opcode_valid = 0;
+        trace_in_terminator = 0u;
         if (state->program != NULL) {
             const xair_sym_compiled_block *compiled;
             if (state->block >= state->program->block_count) { status = XAIR_SYM_ERR_BAD_ARG; goto fail; }
             compiled = &state->program->blocks[state->block];
             op_count = compiled->op_count;
-            for (i = 0; i < op_count; ++i) { status = execute_op_view(state, &compiled->ops[i]); if (status != XAIR_SYM_OK) goto fail; }
+            for (i = 0; i < op_count; ++i) {
+                trace_op_index = i;
+                trace_opcode = compiled->ops[i].opcode;
+                trace_opcode_valid = 1;
+                status = execute_op_view(state, &compiled->ops[i]);
+                if (status != XAIR_SYM_OK) goto fail;
+            }
+            trace_in_terminator = 1u;
             term = compiled->terminator;
             state->context->stats.compiled_dispatches++;
         } else {
             if (xair_block_ops(state->module, state->block, &ops, &op_count) != XAIR_OK) { status = XAIR_SYM_ERR_BAD_ARG; goto fail; }
-            for (i = 0; i < op_count; ++i) { status = execute_op(state, ops[i]); if (status != XAIR_SYM_OK) goto fail; }
+            for (i = 0; i < op_count; ++i) {
+                xair_op_view op_view;
+                trace_op_index = i;
+                if (xair_module_get_op(state->module, ops[i], &op_view) == XAIR_OK) {
+                    trace_opcode = op_view.opcode;
+                    trace_opcode_valid = 1;
+                } else {
+                    trace_opcode_valid = 0;
+                }
+                status = execute_op(state, ops[i]);
+                if (status != XAIR_SYM_OK) goto fail;
+            }
+            trace_in_terminator = 1u;
             if (xair_block_terminator(state->module, state->block, &term) != XAIR_OK) { status = XAIR_SYM_ERR_BAD_ARG; goto fail; }
         }
         if (term.kind == XAIR_TERM_VIEW_JUMP) {
@@ -455,6 +558,15 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
     free(queue);
     return XAIR_SYM_OK;
 fail:
+    if (getenv("XAIR_SYM_TRACE_FAILURES") != NULL) {
+        fprintf(stderr,
+            "xair_sym failure: status=%s block=%u phase=%s op_index=%zu opcode=%s\n",
+            xair_sym_status_name(status),
+            state != NULL ? state->block : trace_block,
+            trace_in_terminator ? "terminator" : "op",
+            trace_op_index,
+            trace_opcode_valid ? xair_opcode_name(trace_opcode) : "<invalid>");
+    }
     xair_sym_state_destroy(state);
     for (cursor = 0; cursor < queued; ++cursor) xair_sym_state_destroy(queue[cursor]);
     free(visits);
