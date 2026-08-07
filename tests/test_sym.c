@@ -559,6 +559,47 @@ static void test_v03_z3_wide_constants_agree_with_concrete_bits(void) {
     xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
 }
 
+typedef struct { xair_sym_context *context; xair_value_id flags[6]; size_t calls; } flag_solver_terminal;
+static xair_sym_status check_all_flag_extracts_with_solver(xair_sym_state *state, void *user) {
+    static const uint64_t expected[6] = {0, 0, 1, 0, 1, 1};
+    flag_solver_terminal *terminal = (flag_solver_terminal *)user;
+    size_t i;
+    terminal->calls++;
+    for (i = 0; i < 6; ++i) {
+        xair_sym_expr_id actual, constant, equality;
+        xair_sym_sat sat;
+        if (xair_sym_state_get_value(state, terminal->flags[i], &actual) != XAIR_SYM_OK) return XAIR_SYM_ERR_BAD_ARG;
+        if (xair_sym_const(terminal->context, 1, expected[i], &constant) != XAIR_SYM_OK) return XAIR_SYM_ERR_OOM;
+        if (xair_sym_binary(terminal->context, XAIR_OP_EQ, 1, actual, constant, &equality) != XAIR_SYM_OK)
+            return XAIR_SYM_ERR_BAD_ARG;
+        if (xair_sym_check(state, equality, &sat) != XAIR_SYM_OK || sat != XAIR_SYM_SAT) return XAIR_SYM_ERR_SOLVER;
+    }
+    return XAIR_SYM_OK;
+}
+
+static void test_phase3_all_emitted_flag_extracts_translate_to_z3(void) {
+    static const xair_opcode extracts[6] = { XAIR_OP_FLAG_CF, XAIR_OP_FLAG_PF, XAIR_OP_FLAG_AF,
+        XAIR_OP_FLAG_ZF, XAIR_OP_FLAG_SF, XAIR_OP_FLAG_OF };
+    xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL;
+    xair_block_id block; xair_value_id lhs, rhs, flags; xair_sym_expr_id lhs_value, rhs_value;
+    flag_solver_terminal terminal; size_t i;
+    memset(&terminal, 0, sizeof(terminal));
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "flags", &block));
+    require_xair(xair_block_add_param(module, block, xair_type_i(8), "lhs", &lhs));
+    require_xair(xair_block_add_param(module, block, xair_type_i(8), "rhs", &rhs));
+    require_xair(xair_build_binary(module, block, XAIR_OP_FLAGS_ADD, xair_type_flags(6), lhs, rhs, "flags", &flags));
+    for (i = 0; i < 6; ++i)
+        require_xair(xair_build_unary(module, block, extracts[i], xair_type_i(1), flags, "flag", &terminal.flags[i]));
+    require_xair(xair_set_return(module, block, terminal.flags, 6));
+    require_sym(xair_sym_context_create(&context)); terminal.context = context;
+    require_sym(xair_sym_state_create(context, module, block, &state));
+    require_sym(xair_sym_const(context, 8, 0x7f, &lhs_value)); require_sym(xair_sym_const(context, 8, 1, &rhs_value));
+    require_sym(xair_sym_state_set_value(state, lhs, lhs_value)); require_sym(xair_sym_state_set_value(state, rhs, rhs_value));
+    require_sym(xair_sym_explore(state, 4, 4, check_all_flag_extracts_with_solver, &terminal));
+    assert(terminal.calls == 1);
+    xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
 int main(void) {
     test_solver_cancellation_reports_diagnostic();
     test_symbolic_and_taint_names_are_not_truncated();
@@ -580,6 +621,7 @@ int main(void) {
     test_v03_unknown_branch_forks_both_paths();
     test_v03_symbolic_call_model_intercepts_call();
     test_v03_z3_wide_constants_agree_with_concrete_bits();
+    test_phase3_all_emitted_flag_extracts_translate_to_z3();
     test_parallel_isolated_workers();
     return 0;
 }

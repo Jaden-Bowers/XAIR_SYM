@@ -127,27 +127,84 @@ static Z3_ast as_bool(Z3_context context, Z3_ast value) {
     return Z3_mk_eq(context, value, Z3_mk_unsigned_int64(context, 1, sort));
 }
 
-static Z3_ast translate_flag_zf(z3_translation *translation, const xair_sym_expr *extract) {
+static Z3_ast translate_flag(z3_translation *translation, const xair_sym_expr *extract) {
     const xair_sym_expr *flags = translation->source->expressions[extract->args[0]];
-    Z3_ast result;
-    Z3_ast zero;
+    Z3_ast lhs, rhs = NULL, result;
+    Z3_ast zero, lhs_sign, rhs_sign = NULL, result_sign;
     Z3_sort sort;
+    uint16_t bits;
 
     if (flags->kind != XAIR_SYM_EXPR_XAIR || flags->arg_count == 0) return NULL;
+    lhs = translate(translation, flags->args[0]);
+    if (lhs == NULL) return NULL;
+    bits = translation->source->expressions[flags->args[0]]->bits;
     if (flags->opcode == XAIR_OP_FLAGS_LOGIC) {
-        result = translate(translation, flags->args[0]);
-    } else if (flags->opcode == XAIR_OP_FLAGS_ADD || flags->opcode == XAIR_OP_FLAGS_SUB) {
-        Z3_ast args[2]; args[0] = translate(translation, flags->args[0]); args[1] = translate(translation, flags->args[1]);
-        if (args[0] == NULL || args[1] == NULL) return NULL;
-        result = flags->opcode == XAIR_OP_FLAGS_ADD ? Z3_mk_bvadd(translation->context, args[0], args[1]) :
-            Z3_mk_bvsub(translation->context, args[0], args[1]);
+        result = lhs;
+    } else if (flags->opcode == XAIR_OP_FLAGS_ADD || flags->opcode == XAIR_OP_FLAGS_SUB ||
+        flags->opcode == XAIR_OP_FLAGS_SHL) {
+        rhs = translate(translation, flags->args[1]);
+        if (rhs == NULL) return NULL;
+        result = flags->opcode == XAIR_OP_FLAGS_ADD ? Z3_mk_bvadd(translation->context, lhs, rhs) :
+            flags->opcode == XAIR_OP_FLAGS_SUB ? Z3_mk_bvsub(translation->context, lhs, rhs) :
+            Z3_mk_bvshl(translation->context, lhs, rhs);
     } else {
         return NULL;
     }
     if (result == NULL) return NULL;
     sort = Z3_get_sort(translation->context, result);
     zero = Z3_mk_unsigned_int64(translation->context, 0, sort);
-    return bv1_from_bool(translation->context, Z3_mk_eq(translation->context, result, zero));
+    switch (extract->opcode) {
+    case XAIR_OP_FLAG_ZF:
+        return bv1_from_bool(translation->context, Z3_mk_eq(translation->context, result, zero));
+    case XAIR_OP_FLAG_SF:
+        return Z3_mk_extract(translation->context, bits - 1u, bits - 1u, result);
+    case XAIR_OP_FLAG_PF: {
+        Z3_ast parity = Z3_mk_extract(translation->context, 0, 0, result);
+        unsigned i;
+        for (i = 1; i < 8u && i < bits; ++i) parity = Z3_mk_bvxor(translation->context, parity,
+            Z3_mk_extract(translation->context, i, i, result));
+        return bv1_from_bool(translation->context, Z3_mk_eq(translation->context, parity,
+            Z3_mk_unsigned_int64(translation->context, 0, Z3_mk_bv_sort(translation->context, 1))));
+    }
+    case XAIR_OP_FLAG_CF:
+        if (flags->opcode == XAIR_OP_FLAGS_LOGIC) return Z3_mk_unsigned_int64(translation->context, 0,
+            Z3_mk_bv_sort(translation->context, 1));
+        if (flags->opcode == XAIR_OP_FLAGS_ADD)
+            return bv1_from_bool(translation->context, Z3_mk_bvult(translation->context, result, lhs));
+        if (flags->opcode == XAIR_OP_FLAGS_SUB)
+            return bv1_from_bool(translation->context, Z3_mk_bvult(translation->context, lhs, rhs));
+        {
+            Z3_ast width = Z3_mk_unsigned_int64(translation->context, bits, sort);
+            Z3_ast amount = Z3_mk_bvsub(translation->context, width, rhs);
+            return Z3_mk_extract(translation->context, 0, 0,
+                Z3_mk_bvlshr(translation->context, lhs, amount));
+        }
+    case XAIR_OP_FLAG_OF:
+        if (flags->opcode == XAIR_OP_FLAGS_LOGIC) return Z3_mk_unsigned_int64(translation->context, 0,
+            Z3_mk_bv_sort(translation->context, 1));
+        lhs_sign = Z3_mk_extract(translation->context, bits - 1u, bits - 1u, lhs);
+        result_sign = Z3_mk_extract(translation->context, bits - 1u, bits - 1u, result);
+        if (flags->opcode == XAIR_OP_FLAGS_SHL) {
+            Z3_ast width = Z3_mk_unsigned_int64(translation->context, bits, sort);
+            Z3_ast cf = Z3_mk_extract(translation->context, 0, 0, Z3_mk_bvlshr(translation->context, lhs,
+                Z3_mk_bvsub(translation->context, width, rhs)));
+            return Z3_mk_bvxor(translation->context, result_sign, cf);
+        }
+        rhs_sign = Z3_mk_extract(translation->context, bits - 1u, bits - 1u, rhs);
+        return bv1_from_bool(translation->context,
+            Z3_mk_and(translation->context, 2, (Z3_ast[]){
+                flags->opcode == XAIR_OP_FLAGS_ADD ?
+                    Z3_mk_eq(translation->context, lhs_sign, rhs_sign) :
+                    Z3_mk_not(translation->context, Z3_mk_eq(translation->context, lhs_sign, rhs_sign)),
+                Z3_mk_not(translation->context, Z3_mk_eq(translation->context, lhs_sign, result_sign)) }));
+    case XAIR_OP_FLAG_AF:
+        if (flags->opcode == XAIR_OP_FLAGS_LOGIC || flags->opcode == XAIR_OP_FLAGS_SHL) return NULL;
+        return Z3_mk_bvxor(translation->context,
+            Z3_mk_bvxor(translation->context, Z3_mk_extract(translation->context, 4, 4, lhs),
+                Z3_mk_extract(translation->context, 4, 4, rhs)),
+            Z3_mk_extract(translation->context, 4, 4, result));
+    default: return NULL;
+    }
 }
 
 static Z3_ast translate_xair(z3_translation *t, const xair_sym_expr *expr) {
@@ -189,7 +246,13 @@ static Z3_ast translate_xair(z3_translation *t, const xair_sym_expr *expr) {
         return expr->opcode == XAIR_OP_ADDR_ADD ? Z3_mk_bvadd(t->context, a, b) : Z3_mk_bvsub(t->context, a, b);
     case XAIR_OP_INT_TO_ADDR:
     case XAIR_OP_ADDR_TO_INT: return a;
-    case XAIR_OP_FLAG_ZF: return translate_flag_zf(t, expr);
+    case XAIR_OP_FLAG_ZF:
+    case XAIR_OP_FLAG_CF:
+    case XAIR_OP_FLAG_OF:
+    case XAIR_OP_FLAG_SF:
+    case XAIR_OP_FLAG_PF:
+    case XAIR_OP_FLAG_AF:
+        return translate_flag(t, expr);
     default: return NULL;
     }
 }
