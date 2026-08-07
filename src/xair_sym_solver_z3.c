@@ -194,6 +194,17 @@ static Z3_ast translate_xair(z3_translation *t, const xair_sym_expr *expr) {
     }
 }
 
+static Z3_ast translate_constant(z3_translation *translation, const xair_sym_expr *expr, Z3_sort sort) {
+    if (expr->bits <= 64) return Z3_mk_unsigned_int64(translation->context, expr->immediate, sort);
+    {
+        Z3_sort high_sort = Z3_mk_bv_sort(translation->context, expr->bits - 64u);
+        Z3_sort low_sort = Z3_mk_bv_sort(translation->context, 64u);
+        Z3_ast high = Z3_mk_unsigned_int64(translation->context, expr->immediate_hi, high_sort);
+        Z3_ast low = Z3_mk_unsigned_int64(translation->context, expr->immediate, low_sort);
+        return Z3_mk_concat(translation->context, high, low);
+    }
+}
+
 static Z3_ast translate(z3_translation *t, xair_sym_expr_id id) {
     const xair_sym_expr *expr;
     Z3_sort sort;
@@ -201,7 +212,7 @@ static Z3_ast translate(z3_translation *t, xair_sym_expr_id id) {
     if (id >= t->source->expression_count) return NULL;
     if (t->defined[id]) return t->cache[id];
     expr = t->source->expressions[id]; sort = Z3_mk_bv_sort(t->context, expr->bits);
-    if (expr->kind == XAIR_SYM_EXPR_CONST) ast = Z3_mk_unsigned_int64(t->context, expr->immediate, sort);
+    if (expr->kind == XAIR_SYM_EXPR_CONST) ast = translate_constant(t, expr, sort);
     else if (expr->kind == XAIR_SYM_EXPR_SYMBOL) ast = Z3_mk_const(t->context,
         Z3_mk_string_symbol(t->context, expr->symbol), sort);
     else ast = translate_xair(t, expr);

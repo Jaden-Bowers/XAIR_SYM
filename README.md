@@ -1,6 +1,6 @@
 # XAIR Symbolic Engine
 
-XAIR Symbolic is governed by XA IR semantic contract 1.0.0 in
+XAIR Symbolic is governed by XA IR semantic contract 1.1.0 in
 [`../xair/docs/semantics.md`](../xair/docs/semantics.md). Solver `unknown`, timeout,
 cancellation, resource limits, Unknown values, faults, and Opaque operations must
 follow that contract; any baseline gap listed there makes dependent results
@@ -16,7 +16,7 @@ XAIR Symbolic is a C library for symbolic execution and object-based symbolic
 memory over frozen XAIR modules and XAIR CFGs. It is a separate project from the
 IR generator and CFG recovery engine and consumes their public C APIs.
 
-Current version: 0.4.0. Blocks A through E are complete at the native runtime
+Current version: 0.5.0. Blocks A through E are complete at the native runtime
 baseline.
 
 Implemented:

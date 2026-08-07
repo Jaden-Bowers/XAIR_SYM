@@ -68,6 +68,13 @@ xair_sym_status xair_sym_state_get_value(const xair_sym_state *state, xair_value
     *out_expr = state->values[value]; return XAIR_SYM_OK;
 }
 
+void xair_sym_state_set_call_model(
+    xair_sym_state *state, xair_sym_call_model_cb callback, void *user) {
+    if (state == NULL) return;
+    state->call_model = callback;
+    state->call_model_user = user;
+}
+
 xair_sym_status xair_sym_state_assume(xair_sym_state *state, xair_sym_expr_id condition) {
     xair_sym_constraint *constraint;
     if (state == NULL || condition >= state->context->expression_count || state->context->expressions[condition]->bits != 1) return XAIR_SYM_ERR_BAD_ARG;
@@ -254,6 +261,42 @@ static xair_sym_status execute_op_view(xair_sym_state *state, const xair_op_view
 
 static xair_sym_status execute_op(xair_sym_state *state, xair_op_id id) {
     xair_op_view op;
+    xair_op_view_v3 op_v3;
+    const xair_value_id *results;
+    size_t result_count;
+    size_t i;
+    if (xair_module_get_op_v3(state->module, id, &op_v3) != XAIR_OK ||
+        xair_op_results(state->module, id, &results, &result_count) != XAIR_OK)
+        return XAIR_SYM_ERR_BAD_ARG;
+    if (op_v3.opcode == XAIR_OP_CONST_WIDE) {
+        uint64_t lo, hi; xair_sym_expr_id constant; xair_type type;
+        if (result_count != 1 || xair_op_immediate_wide(state->module, id, &lo, &hi) != XAIR_OK)
+            return XAIR_SYM_ERR_BAD_ARG;
+        type = xair_value_type(state->module, results[0]);
+        if (xair_sym_const_wide(state->context, type.bits, lo, hi, &constant) != XAIR_SYM_OK)
+            return XAIR_SYM_ERR_BAD_ARG;
+        return xair_sym_state_set_value(state, results[0], constant);
+    }
+    if (op_v3.opcode == XAIR_OP_CALL && state->call_model != NULL)
+        return state->call_model(state, id, state->call_model_user);
+    if (op_v3.opcode == XAIR_OP_UNKNOWN || op_v3.opcode == XAIR_OP_UNDEF ||
+        op_v3.opcode == XAIR_OP_OPAQUE_PURE || op_v3.opcode == XAIR_OP_OPAQUE_EFFECT ||
+        op_v3.opcode == XAIR_OP_CALL || op_v3.opcode == XAIR_OP_INTRINSIC) {
+        for (i = 0; i < result_count; ++i) {
+            char name[64];
+            xair_type type = xair_value_type(state->module, results[i]);
+            xair_sym_expr_id expr;
+            xair_sym_status status;
+            (void)snprintf(name, sizeof(name), "%s_%u_%u", xair_opcode_name(op_v3.opcode),
+                (unsigned)id, (unsigned)i);
+            status = xair_sym_symbol(state->context, type.bits == 0 ? 1u : type.bits, name, &expr);
+            if (status != XAIR_SYM_OK) return status;
+            status = xair_sym_state_set_value(state, results[i], expr);
+            if (status != XAIR_SYM_OK) return status;
+        }
+        return XAIR_SYM_OK;
+    }
+    if (op_v3.opcode == XAIR_OP_MEMORY_BARRIER) return XAIR_SYM_OK;
     if (xair_module_get_op(state->module, id, &op) != XAIR_OK) return XAIR_SYM_ERR_BAD_ARG;
     return execute_op_view(state, &op);
 }
@@ -487,7 +530,7 @@ xair_sym_status xair_sym_explore_with_options_ex(xair_sym_state *initial, const 
                 trace_op_index = i;
                 trace_opcode = compiled->ops[i].opcode;
                 trace_opcode_valid = 1;
-                status = execute_op_view(state, &compiled->ops[i]);
+                status = execute_op(state, compiled->op_ids[i]);
                 if (status != XAIR_SYM_OK) goto fail;
             }
             trace_in_terminator = 1u;

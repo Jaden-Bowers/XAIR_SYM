@@ -483,6 +483,82 @@ static void test_solver_cancellation_reports_diagnostic(void) {
     xair_module_destroy(module);
 }
 
+static void test_v03_unknown_branch_forks_both_paths(void) {
+    xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL;
+    xair_block_id entry, yes, no; xair_value_id condition; terminal_counts counts;
+    memset(&counts, 0, sizeof(counts));
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &entry));
+    require_xair(xair_block_create(module, "yes", &yes)); require_xair(xair_block_create(module, "no", &no));
+    require_xair(xair_build_unknown(module, entry, xair_type_i(1), "undefined_zf", "condition", &condition));
+    require_xair(xair_set_cbranch(module, entry, condition, yes, NULL, 0, no, NULL, 0));
+    require_xair(xair_set_return(module, yes, NULL, 0)); require_xair(xair_set_return(module, no, NULL, 0));
+    require_sym(xair_sym_context_create(&context)); require_sym(xair_sym_state_create(context, module, entry, &state));
+    require_sym(xair_sym_explore(state, 8, 8, count_terminal, &counts));
+    assert(counts.count == 2 && counts.seen_true && counts.seen_false);
+    xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
+typedef struct { xair_value_id result; xair_sym_expr_id modeled; size_t calls; } call_model_test;
+static xair_sym_status test_call_model(xair_sym_state *state, xair_op_id call_op, void *user) {
+    call_model_test *model = (call_model_test *)user;
+    assert(call_op == 0); model->calls++;
+    return xair_sym_state_set_value(state, model->result, model->modeled);
+}
+
+static void test_v03_symbolic_call_model_intercepts_call(void) {
+    xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL;
+    xair_sym_program *program = NULL;
+    xair_block_id entry; xair_value_id result; xair_type type = xair_type_i(64);
+    const char *name = "rax"; xair_op_attributes attributes; call_model_test model; terminal_counts terminals;
+    memset(&attributes, 0, sizeof(attributes)); memset(&model, 0, sizeof(model)); memset(&terminals, 0, sizeof(terminals));
+    attributes.kind = XAIR_ATTR_CALL; attributes.effects = XAIR_EFFECT_READ_MEMORY;
+    attributes.call_kind = XAIR_CALL_DIRECT_EXTERNAL; attributes.calling_convention = XAIR_CC_WIN64;
+    attributes.import_module = "KERNEL32.dll"; attributes.import_name = "GetTickCount64";
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &entry));
+    require_xair(xair_build_call(module, entry, NULL, 0, &type, &name, 1, &attributes, &result));
+    require_xair(xair_set_return(module, entry, &result, 1));
+    require_xair(xair_module_freeze(module)); require_sym(xair_sym_program_compile(module, &program));
+    require_sym(xair_sym_context_create(&context)); require_sym(xair_sym_const(context, 64, 1234, &model.modeled));
+    require_sym(xair_sym_state_create(context, module, entry, &state)); model.result = result;
+    require_sym(xair_sym_state_attach_program(state, program));
+    xair_sym_state_set_call_model(state, test_call_model, &model);
+    require_sym(xair_sym_explore(state, 4, 4, count_terminal, &terminals));
+    assert(model.calls == 1 && terminals.count == 1);
+    xair_sym_state_destroy(state); xair_sym_program_destroy(program); xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
+static void test_v03_z3_wide_constants_agree_with_concrete_bits(void) {
+    xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL;
+    xair_block_id entry; xair_sym_expr_id lhs, rhs, value, expected, equality; xair_sym_sat sat;
+    uint64_t seed = UINT64_C(0x9e3779b97f4a7c15); size_t i;
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &entry));
+    require_xair(xair_set_return(module, entry, NULL, 0));
+    require_sym(xair_sym_context_create(&context)); require_sym(xair_sym_state_create(context, module, entry, &state));
+    require_sym(xair_sym_const_wide(context, 128, UINT64_C(0x1122334455667788), UINT64_C(0x99aabbccddeeff00), &lhs));
+    require_sym(xair_sym_const_wide(context, 128, UINT64_C(0x00ff00ff00ff00ff), UINT64_C(0x00ff00ff00ff00ff), &rhs));
+    require_sym(xair_sym_binary(context, XAIR_OP_XOR, 128, lhs, rhs, &value));
+    require_sym(xair_sym_const_wide(context, 128, UINT64_C(0x11dd33bb55997777), UINT64_C(0x9955bb33dd11ffff), &expected));
+    assert(lhs != rhs && value != expected);
+    require_sym(xair_sym_binary(context, XAIR_OP_EQ, 1, value, expected, &equality));
+    require_sym(xair_sym_state_assume(state, equality));
+    for (i = 0; i < 32; ++i) {
+        uint64_t alo, ahi, blo, bhi;
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; alo = seed;
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; ahi = seed;
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; blo = seed;
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; bhi = seed;
+        require_sym(xair_sym_const_wide(context, 128, alo, ahi, &lhs));
+        require_sym(xair_sym_const_wide(context, 128, blo, bhi, &rhs));
+        require_sym(xair_sym_binary(context, XAIR_OP_XOR, 128, lhs, rhs, &value));
+        require_sym(xair_sym_const_wide(context, 128, alo ^ blo, ahi ^ bhi, &expected));
+        require_sym(xair_sym_binary(context, XAIR_OP_EQ, 1, value, expected, &equality));
+        require_sym(xair_sym_state_assume(state, equality));
+    }
+    require_sym(xair_sym_check(state, XAIR_SYM_INVALID_ID, &sat));
+    assert(sat == XAIR_SYM_SAT);
+    xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
 int main(void) {
     test_solver_cancellation_reports_diagnostic();
     test_symbolic_and_taint_names_are_not_truncated();
@@ -501,6 +577,9 @@ int main(void) {
     test_process_environment_and_models();
     test_snapshot_roundtrip_preserves_state();
     test_compiled_dispatch_and_cancellation();
+    test_v03_unknown_branch_forks_both_paths();
+    test_v03_symbolic_call_model_intercepts_call();
+    test_v03_z3_wide_constants_agree_with_concrete_bits();
     test_parallel_isolated_workers();
     return 0;
 }

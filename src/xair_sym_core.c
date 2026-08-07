@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define XAIR_SYM_VERSION_TEXT "0.4.0"
+#define XAIR_SYM_VERSION_TEXT "0.5.0"
 
 const char *xair_sym_version_string(void) { return XAIR_SYM_VERSION_TEXT; }
 uint32_t xair_sym_version_u32(void) {
@@ -54,6 +54,7 @@ static uint64_t expr_hash(const xair_sym_expr *expr) {
     hash = mix(hash, expr->bits);
     hash = mix(hash, expr->arg_count);
     hash = mix(hash, expr->immediate);
+    hash = mix(hash, expr->immediate_hi);
     for (i = 0; i < expr->arg_count; ++i) {
         hash = mix(hash, expr->args[i]);
     }
@@ -66,7 +67,7 @@ static uint64_t expr_hash(const xair_sym_expr *expr) {
 static int expr_equal(const xair_sym_expr *lhs, const xair_sym_expr *rhs) {
     return lhs->kind == rhs->kind && lhs->opcode == rhs->opcode &&
         lhs->bits == rhs->bits && lhs->arg_count == rhs->arg_count &&
-        lhs->immediate == rhs->immediate &&
+        lhs->immediate == rhs->immediate && lhs->immediate_hi == rhs->immediate_hi &&
         memcmp(lhs->args, rhs->args, sizeof(lhs->args)) == 0 &&
         strcmp(lhs->symbol == NULL ? "" : lhs->symbol,
             rhs->symbol == NULL ? "" : rhs->symbol) == 0;
@@ -237,11 +238,18 @@ static uint64_t mask_bits(uint16_t bits) {
 }
 
 xair_sym_status xair_sym_const(xair_sym_context *context, uint16_t bits, uint64_t value, xair_sym_expr_id *out_expr) {
+    return xair_sym_const_wide(context, bits, value, 0, out_expr);
+}
+
+xair_sym_status xair_sym_const_wide(xair_sym_context *context, uint16_t bits,
+    uint64_t lo, uint64_t hi, xair_sym_expr_id *out_expr) {
     xair_sym_expr expr;
+    if (bits == 0 || bits > 128 || (bits <= 64 && hi != 0)) return XAIR_SYM_ERR_BAD_ARG;
     memset(&expr, 0, sizeof(expr));
     expr.kind = XAIR_SYM_EXPR_CONST;
     expr.bits = bits;
-    expr.immediate = value & mask_bits(bits);
+    expr.immediate = lo & mask_bits(bits);
+    expr.immediate_hi = bits <= 64 ? 0 : hi & mask_bits((uint16_t)(bits - 64u));
     return xair_sym_intern(context, &expr, out_expr);
 }
 
@@ -261,7 +269,8 @@ xair_sym_status xair_sym_unary(xair_sym_context *context, xair_opcode opcode, ui
     xair_sym_expr_id src, uint64_t immediate, xair_sym_expr_id *out_expr) {
     xair_sym_expr expr;
     if (context == NULL || src >= context->expression_count) return XAIR_SYM_ERR_BAD_ARG;
-    if (context->expressions[src]->kind == XAIR_SYM_EXPR_CONST) {
+    if (context->expressions[src]->kind == XAIR_SYM_EXPR_CONST &&
+        context->expressions[src]->bits <= 64 && bits <= 64) {
         uint64_t value = context->expressions[src]->immediate;
         if (opcode == XAIR_OP_TRUNC || opcode == XAIR_OP_ZEXT || opcode == XAIR_OP_INT_TO_ADDR ||
             opcode == XAIR_OP_ADDR_TO_INT) return xair_sym_const(context, bits, value, out_expr);
@@ -286,7 +295,8 @@ xair_sym_status xair_sym_binary(xair_sym_context *context, xair_opcode opcode, u
         opcode == XAIR_OP_XOR || opcode == XAIR_OP_EQ || opcode == XAIR_OP_NE) && lhs > rhs) {
         xair_sym_expr_id temporary = lhs; lhs = rhs; rhs = temporary;
     }
-    if (context->expressions[rhs]->kind == XAIR_SYM_EXPR_CONST && context->expressions[rhs]->immediate == 0) {
+    if (context->expressions[rhs]->kind == XAIR_SYM_EXPR_CONST &&
+        context->expressions[rhs]->immediate == 0 && context->expressions[rhs]->immediate_hi == 0) {
         if (opcode == XAIR_OP_ADD || opcode == XAIR_OP_SUB || opcode == XAIR_OP_OR || opcode == XAIR_OP_XOR ||
             opcode == XAIR_OP_SHL || opcode == XAIR_OP_LSHR || opcode == XAIR_OP_ASHR ||
             opcode == XAIR_OP_ROL || opcode == XAIR_OP_ROR) {
@@ -347,6 +357,7 @@ xair_sym_status xair_sym_expr_get(const xair_sym_context *context, xair_sym_expr
     expr = context->expressions[id]; memset(out, 0, sizeof(*out)); out->kind = expr->kind;
     out->opcode = expr->opcode; out->bits = expr->bits; out->arg_count = expr->arg_count;
     memcpy(out->args, expr->args, sizeof(out->args)); out->immediate = expr->immediate;
+    out->immediate_hi = expr->immediate_hi;
     out->symbol = expr->kind == XAIR_SYM_EXPR_SYMBOL ? expr->symbol : NULL; return XAIR_SYM_OK;
 }
 

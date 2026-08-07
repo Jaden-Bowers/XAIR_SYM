@@ -12,6 +12,7 @@ typedef struct {
     uint8_t arg_count;
     xair_sym_expr_id args[3];
     uint64_t immediate;
+    uint64_t immediate_hi;
     uint64_t hash;
     uint64_t dependencies;
     const char *symbol;
@@ -114,10 +115,13 @@ struct xair_sym_state {
     xair_sym_taint_id control_taint;
     const xair_sym_program *program;
     xair_sym_execution_mode execution_mode;
+    xair_sym_call_model_cb call_model;
+    void *call_model_user;
 };
 
 typedef struct {
     xair_op_view *ops;
+    xair_op_id *op_ids;
     size_t op_count;
     xair_term_view terminator;
 } xair_sym_compiled_block;

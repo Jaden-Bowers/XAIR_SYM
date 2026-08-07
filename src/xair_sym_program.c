@@ -24,8 +24,12 @@ xair_sym_status xair_sym_program_compile(const xair_module *module, xair_sym_pro
         program->blocks[block_i].op_count = op_count;
         if (op_count == 0) continue;
         program->blocks[block_i].ops = (xair_op_view *)malloc(op_count * sizeof(*program->blocks[block_i].ops));
-        if (program->blocks[block_i].ops == NULL) { xair_sym_program_destroy(program); return XAIR_SYM_ERR_OOM; }
+        program->blocks[block_i].op_ids = (xair_op_id *)malloc(op_count * sizeof(*program->blocks[block_i].op_ids));
+        if (program->blocks[block_i].ops == NULL || program->blocks[block_i].op_ids == NULL) {
+            xair_sym_program_destroy(program); return XAIR_SYM_ERR_OOM;
+        }
         for (op_i = 0; op_i < op_count; ++op_i) {
+            program->blocks[block_i].op_ids[op_i] = ops[op_i];
             if (xair_module_get_op(module, ops[op_i], &program->blocks[block_i].ops[op_i]) != XAIR_OK) {
                 xair_sym_program_destroy(program); return XAIR_SYM_ERR_BAD_ARG;
             }
@@ -38,7 +42,10 @@ xair_sym_status xair_sym_program_compile(const xair_module *module, xair_sym_pro
 void xair_sym_program_destroy(xair_sym_program *program) {
     size_t i;
     if (program == NULL) return;
-    for (i = 0; i < program->block_count; ++i) free(program->blocks[i].ops);
+    for (i = 0; i < program->block_count; ++i) {
+        free(program->blocks[i].op_ids);
+        free(program->blocks[i].ops);
+    }
     free(program->blocks); free(program);
 }
 

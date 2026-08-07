@@ -52,6 +52,7 @@ typedef struct {
     uint8_t arg_count;
     xair_sym_expr_id args[3];
     uint64_t immediate;
+    uint64_t immediate_hi;
     const char *symbol;
 } xair_sym_expr_view;
 
@@ -129,6 +130,8 @@ typedef struct xair_sym_environment xair_sym_environment;
 typedef struct xair_sym_program xair_sym_program;
 typedef struct xair_sym_snapshot xair_sym_snapshot;
 typedef xair_sym_status (*xair_sym_terminal_cb)(xair_sym_state *state, void *user);
+typedef xair_sym_status (*xair_sym_call_model_cb)(
+    xair_sym_state *state, xair_op_id call_op, void *user);
 
 const char *xair_sym_version_string(void);
 uint32_t xair_sym_version_u32(void);
@@ -191,6 +194,9 @@ xair_sym_status xair_sym_taint_get(
 
 xair_sym_status xair_sym_const(
     xair_sym_context *context, uint16_t bits, uint64_t value, xair_sym_expr_id *out_expr);
+xair_sym_status xair_sym_const_wide(
+    xair_sym_context *context, uint16_t bits, uint64_t lo, uint64_t hi,
+    xair_sym_expr_id *out_expr);
 xair_sym_status xair_sym_symbol(
     xair_sym_context *context, uint16_t bits, const char *name, xair_sym_expr_id *out_expr);
 xair_sym_status xair_sym_unary(
@@ -214,6 +220,8 @@ xair_sym_status xair_sym_state_set_value(
     xair_sym_state *state, xair_value_id value, xair_sym_expr_id expr);
 xair_sym_status xair_sym_state_get_value(
     const xair_sym_state *state, xair_value_id value, xair_sym_expr_id *out_expr);
+void xair_sym_state_set_call_model(
+    xair_sym_state *state, xair_sym_call_model_cb callback, void *user);
 xair_sym_status xair_sym_state_assume(xair_sym_state *state, xair_sym_expr_id condition);
 xair_sym_status xair_sym_state_set_taint(
     xair_sym_state *state, xair_value_id value, xair_sym_taint_id taint);
