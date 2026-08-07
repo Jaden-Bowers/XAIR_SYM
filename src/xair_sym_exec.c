@@ -259,6 +259,33 @@ static xair_sym_status execute_op_view(xair_sym_state *state, const xair_op_view
     return xair_sym_state_set_taint(state, op.dst, result_taint);
 }
 
+static xair_sym_status execute_x86_div_intrinsic(xair_sym_state *state, xair_op_id id,
+    const xair_op_attributes *attributes) {
+    const xair_value_id *inputs, *results;
+    size_t input_count, result_count;
+    xair_sym_expr_id dividend, divisor, wide_divisor, quotient, remainder, narrowed;
+    xair_sym_status status;
+    uint16_t bits = attributes->width_bits;
+    int is_signed = strcmp(attributes->semantic_id, "x86.idiv") == 0;
+    if (bits == 0 || bits > 64 || xair_op_inputs(state->module, id, &inputs, &input_count) != XAIR_OK ||
+        xair_op_results(state->module, id, &results, &result_count) != XAIR_OK ||
+        input_count != 2 || result_count != 2) return XAIR_SYM_ERR_BAD_ARG;
+    status = xair_sym_state_get_value(state, inputs[0], &dividend); if (status != XAIR_SYM_OK) return status;
+    status = xair_sym_state_get_value(state, inputs[1], &divisor); if (status != XAIR_SYM_OK) return status;
+    status = xair_sym_unary(state->context, is_signed ? XAIR_OP_SEXT : XAIR_OP_ZEXT,
+        (uint16_t)(bits * 2u), divisor, 0, &wide_divisor); if (status != XAIR_SYM_OK) return status;
+    status = xair_sym_binary(state->context, is_signed ? XAIR_OP_SDIV : XAIR_OP_UDIV,
+        (uint16_t)(bits * 2u), dividend, wide_divisor, &quotient); if (status != XAIR_SYM_OK) return status;
+    status = xair_sym_binary(state->context, is_signed ? XAIR_OP_SREM : XAIR_OP_UREM,
+        (uint16_t)(bits * 2u), dividend, wide_divisor, &remainder); if (status != XAIR_SYM_OK) return status;
+    status = xair_sym_unary(state->context, XAIR_OP_TRUNC, bits, quotient, 0, &narrowed);
+    if (status == XAIR_SYM_OK) status = xair_sym_state_set_value(state, results[0], narrowed);
+    if (status != XAIR_SYM_OK) return status;
+    status = xair_sym_unary(state->context, XAIR_OP_TRUNC, bits, remainder, 0, &narrowed);
+    if (status == XAIR_SYM_OK) status = xair_sym_state_set_value(state, results[1], narrowed);
+    return status;
+}
+
 static xair_sym_status execute_op(xair_sym_state *state, xair_op_id id) {
     xair_op_view op;
     xair_op_view_v3 op_v3;
@@ -279,6 +306,13 @@ static xair_sym_status execute_op(xair_sym_state *state, xair_op_id id) {
     }
     if (op_v3.opcode == XAIR_OP_CALL && state->call_model != NULL)
         return state->call_model(state, id, state->call_model_user);
+    if (op_v3.opcode == XAIR_OP_INTRINSIC) {
+        xair_op_attributes attributes;
+        if (xair_op_attributes_get(state->module, id, &attributes) == XAIR_OK &&
+            attributes.semantic_id != NULL &&
+            (strcmp(attributes.semantic_id, "x86.div") == 0 || strcmp(attributes.semantic_id, "x86.idiv") == 0))
+            return execute_x86_div_intrinsic(state, id, &attributes);
+    }
     if (op_v3.opcode == XAIR_OP_UNKNOWN || op_v3.opcode == XAIR_OP_UNDEF ||
         op_v3.opcode == XAIR_OP_OPAQUE_PURE || op_v3.opcode == XAIR_OP_OPAQUE_EFFECT ||
         op_v3.opcode == XAIR_OP_CALL || op_v3.opcode == XAIR_OP_INTRINSIC) {

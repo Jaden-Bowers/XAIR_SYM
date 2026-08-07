@@ -600,6 +600,44 @@ static void test_phase3_all_emitted_flag_extracts_translate_to_z3(void) {
     xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
 }
 
+typedef struct { xair_sym_context *context; xair_value_id quotient; size_t calls; } divide_terminal;
+static xair_sym_status check_symbolic_divide_terminal(xair_sym_state *state, void *user) {
+    divide_terminal *terminal = (divide_terminal *)user;
+    xair_sym_expr_id actual, expected, equality; xair_sym_sat sat;
+    terminal->calls++;
+    if (xair_sym_state_get_value(state, terminal->quotient, &actual) != XAIR_SYM_OK ||
+        xair_sym_const(terminal->context, 64, 5, &expected) != XAIR_SYM_OK ||
+        xair_sym_binary(terminal->context, XAIR_OP_EQ, 1, actual, expected, &equality) != XAIR_SYM_OK ||
+        xair_sym_check(state, equality, &sat) != XAIR_SYM_OK || sat != XAIR_SYM_SAT) return XAIR_SYM_ERR_SOLVER;
+    return XAIR_SYM_OK;
+}
+
+static void test_phase3_x86_div_intrinsic_has_symbolic_value_model(void) {
+    static const uint8_t bytes[] = {0x48,0xf7,0xf3,0xc3};
+    xair_module *module = NULL; xair_image image; xair_lift_options options; xair_lift_result lift;
+    xair_sym_context *context = NULL; xair_sym_state *state = NULL; divide_terminal terminal;
+    size_t i;
+    memset(&options, 0, sizeof(options)); memset(&terminal, 0, sizeof(terminal));
+    require_xair(xair_module_create(&module)); require_xair(xair_image_init(&image, bytes, sizeof(bytes), 0x9000));
+    options.arch = XAIR_ARCH_X86_64; options.address = image.base;
+    require_xair(xair_lift_basic_block(module, &image, &options, &lift));
+    terminal.quotient = XAIR_INVALID_ID;
+    for (i = 0; i < lift.output_reg_count; ++i)
+        if (lift.output_regs[i].reg == XAIR_X86_RAX) terminal.quotient = lift.output_regs[i].value;
+    assert(terminal.quotient != XAIR_INVALID_ID);
+    require_sym(xair_sym_context_create(&context)); terminal.context = context;
+    require_sym(xair_sym_state_create(context, module, lift.block, &state));
+    for (i = 0; i < lift.input_reg_count; ++i) {
+        uint64_t concrete = lift.input_regs[i].reg == XAIR_X86_RAX ? 10u :
+            lift.input_regs[i].reg == XAIR_X86_RBX ? 2u : 0u;
+        xair_sym_expr_id value; require_sym(xair_sym_const(context, 64, concrete, &value));
+        require_sym(xair_sym_state_set_value(state, lift.input_regs[i].value, value));
+    }
+    require_sym(xair_sym_explore(state, 4, 4, check_symbolic_divide_terminal, &terminal));
+    assert(terminal.calls == 1);
+    xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
+}
+
 int main(void) {
     test_solver_cancellation_reports_diagnostic();
     test_symbolic_and_taint_names_are_not_truncated();
@@ -622,6 +660,7 @@ int main(void) {
     test_v03_symbolic_call_model_intercepts_call();
     test_v03_z3_wide_constants_agree_with_concrete_bits();
     test_phase3_all_emitted_flag_extracts_translate_to_z3();
+    test_phase3_x86_div_intrinsic_has_symbolic_value_model();
     test_parallel_isolated_workers();
     return 0;
 }
