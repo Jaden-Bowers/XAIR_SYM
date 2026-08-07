@@ -32,7 +32,8 @@ static xair_sym_status intern_taint(
         node = context->taints[i];
         if (node->hash == candidate->hash && node->kind == candidate->kind &&
             node->lhs == candidate->lhs && node->rhs == candidate->rhs &&
-            strcmp(node->name, candidate->name) == 0) {
+            strcmp(node->name == NULL ? "" : node->name,
+                candidate->name == NULL ? "" : candidate->name) == 0) {
             context->stats.taint_nodes_reused++;
             *out_taint = (xair_sym_taint_id)(i + 1);
             return XAIR_SYM_OK;
@@ -44,6 +45,12 @@ static xair_sym_status intern_taint(
     node = (xair_sym_taint_node *)malloc(sizeof(*node));
     if (node == NULL) return XAIR_SYM_ERR_OOM;
     *node = *candidate;
+    if (candidate->name != NULL) {
+        size_t name_size = strlen(candidate->name) + 1u;
+        node->name = (char *)malloc(name_size);
+        if (node->name == NULL) { free(node); return XAIR_SYM_ERR_OOM; }
+        memcpy(node->name, candidate->name, name_size);
+    }
     context->taints[context->taint_count++] = node;
     context->stats.taint_nodes = context->taint_count;
     *out_taint = (xair_sym_taint_id)context->taint_count;
@@ -63,9 +70,9 @@ xair_sym_status xair_sym_taint_source(
     if (context == NULL || name == NULL || name[0] == '\0' || out_taint == NULL) return XAIR_SYM_ERR_BAD_ARG;
     memset(&node, 0, sizeof(node));
     node.kind = XAIR_SYM_TAINT_NODE_SOURCE;
-    (void)snprintf(node.name, sizeof(node.name), "%s", name);
+    node.name = (char *)name;
     node.hash = UINT64_C(1469598103934665603);
-    cursor = (const unsigned char *)node.name;
+    cursor = (const unsigned char *)name;
     while (*cursor != 0) node.hash = taint_hash(node.hash, *cursor++);
     return intern_taint(context, &node, out_taint);
 }
@@ -100,9 +107,9 @@ xair_sym_status xair_sym_taint_sanitize(
     memset(&node, 0, sizeof(node));
     node.kind = XAIR_SYM_TAINT_NODE_SANITIZER;
     node.lhs = input;
-    (void)snprintf(node.name, sizeof(node.name), "%s", sanitizer);
+    node.name = (char *)sanitizer;
     node.hash = taint_hash(UINT64_C(1469598103934665603), input);
-    cursor = (const unsigned char *)node.name;
+    cursor = (const unsigned char *)sanitizer;
     while (*cursor != 0) node.hash = taint_hash(node.hash, *cursor++);
     return intern_taint(context, &node, out_taint);
 }
@@ -119,7 +126,7 @@ xair_sym_status xair_sym_taint_get(
     out_view->kind = node->kind;
     out_view->lhs = node->lhs;
     out_view->rhs = node->rhs;
-    out_view->name = node->name[0] == '\0' ? NULL : node->name;
+    out_view->name = node->name == NULL || node->name[0] == '\0' ? NULL : node->name;
     return XAIR_SYM_OK;
 }
 

@@ -3,7 +3,7 @@
 
 #include "xair_sym/xair_sym.h"
 
-#include <stdatomic.h>
+#include "xair/xair_platform.h"
 
 typedef struct {
     xair_sym_expr_kind kind;
@@ -14,7 +14,7 @@ typedef struct {
     uint64_t immediate;
     uint64_t hash;
     uint64_t dependencies;
-    char symbol[48];
+    const char *symbol;
 } xair_sym_expr;
 
 typedef struct {
@@ -28,7 +28,7 @@ typedef struct {
     xair_sym_taint_id lhs;
     xair_sym_taint_id rhs;
     uint64_t hash;
-    char name[48];
+    char *name;
 } xair_sym_taint_node;
 
 typedef struct {
@@ -49,7 +49,7 @@ typedef struct xair_sym_arena_chunk {
     struct xair_sym_arena_chunk *next;
     size_t used;
     size_t capacity;
-    unsigned char data[];
+    unsigned char data[1];
 } xair_sym_arena_chunk;
 
 typedef struct {
@@ -76,6 +76,7 @@ typedef struct xair_sym_constraint {
 } xair_sym_constraint;
 
 struct xair_sym_context {
+    xair_analysis_options analysis;
     xair_sym_expr **expressions;
     size_t expression_count;
     size_t expression_capacity;
@@ -83,6 +84,8 @@ struct xair_sym_context {
     size_t hash_count;
     size_t hash_capacity;
     xair_sym_arena_chunk *arena;
+    size_t arena_bytes;
+    size_t object_bytes;
     xair_sym_stats stats;
     xair_sym_taint_node **taints;
     size_t taint_count;
@@ -128,10 +131,6 @@ struct xair_sym_program {
 struct xair_sym_snapshot {
     xair_sym_state *state;
     uint64_t module_fingerprint;
-};
-
-struct xair_sym_cancel_token {
-    atomic_bool requested;
 };
 
 struct xair_sym_trace {

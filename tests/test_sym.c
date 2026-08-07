@@ -268,8 +268,11 @@ static xair_sym_status record_order(xair_sym_state *state, void *user) {
 
 static void test_dfs_policy_and_loop_budget(void) {
     xair_module *module = NULL; xair_sym_context *context = NULL; xair_sym_state *state = NULL;
-    xair_block_id entry, true_block, false_block; xair_value_id condition_value; xair_sym_expr_id condition;
+    xair_block_id entry, true_block, false_block;
+    xair_value_id condition_value, loop_value, one_value, next_value;
+    xair_sym_expr_id condition, zero;
     xair_sym_explore_options options; order_terminal order; xair_sym_stats stats;
+    xair_analysis_result result; xair_diagnostic diagnostic;
     require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "entry", &entry));
     require_xair(xair_block_create(module, "true", &true_block)); require_xair(xair_block_create(module, "false", &false_block));
     require_xair(xair_block_add_param(module, entry, xair_type_i(1), "condition", &condition_value));
@@ -283,10 +286,22 @@ static void test_dfs_policy_and_loop_budget(void) {
     xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
 
     module = NULL; context = NULL; state = NULL;
-    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "loop", &entry)); require_xair(xair_set_jump(module, entry, entry, NULL, 0));
+    require_xair(xair_module_create(&module)); require_xair(xair_block_create(module, "loop", &entry));
+    require_xair(xair_block_add_param(module, entry, xair_type_i(8), "loop_value", &loop_value));
+    require_xair(xair_build_const_u64(module, entry, xair_type_i(8), 1, "one", &one_value));
+    require_xair(xair_build_binary(module, entry, XAIR_OP_ADD, xair_type_i(8),
+        loop_value, one_value, "next", &next_value));
+    require_xair(xair_set_jump(module, entry, entry, &next_value, 1));
     require_sym(xair_sym_context_create(&context)); require_sym(xair_sym_state_create(context, module, entry, &state));
+    require_sym(xair_sym_const(context, 8, 0, &zero));
+    require_sym(xair_sym_state_set_value(state, loop_value, zero));
     xair_sym_explore_options_init(&options); options.max_states = 16; options.max_block_steps = 16; options.max_visits_per_block = 2;
-    require_sym(xair_sym_explore_with_options(state, &options, NULL, NULL)); xair_sym_context_stats(context, &stats);
+    assert(xair_sym_explore_with_options_ex(state, &options, NULL, NULL, &result, &diagnostic) ==
+        XAIR_SYM_ERR_RESOURCE_LIMIT);
+    assert(result.state == XAIR_ANALYSIS_LIMITED);
+    assert(diagnostic.status == XAIR_ERR_RESOURCE_LIMIT);
+    assert(diagnostic.stage == XAIR_STAGE_SYMBOLIC);
+    xair_sym_context_stats(context, &stats);
     assert(stats.scheduler_pruned == 1);
     xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
 }
@@ -385,7 +400,16 @@ static void test_compiled_dispatch_and_cancellation(void) {
     xair_sym_context_stats(context, &stats); assert(stats.compiled_dispatches == 1);
     require_sym(xair_sym_cancel_token_create(&token)); xair_sym_cancel_token_request(token);
     xair_sym_explore_options_init(&options); options.cancel_token = token; counts.count = 0;
-    require_sym(xair_sym_explore_with_options(state, &options, count_terminal, &counts)); assert(counts.count == 0);
+    {
+        xair_analysis_result result;
+        xair_diagnostic diagnostic;
+        assert(xair_sym_explore_with_options_ex(state, &options, count_terminal, &counts,
+            &result, &diagnostic) == XAIR_SYM_ERR_CANCELED);
+        assert(result.state == XAIR_ANALYSIS_CANCELED);
+        assert(diagnostic.status == XAIR_ERR_CANCELED);
+        assert(diagnostic.stage == XAIR_STAGE_SYMBOLIC);
+    }
+    assert(counts.count == 0);
     assert(xair_sym_cancel_token_requested(token)); xair_sym_cancel_token_reset(token); assert(!xair_sym_cancel_token_requested(token));
     xair_sym_cancel_token_destroy(token); xair_sym_program_destroy(program); xair_sym_state_destroy(state);
     xair_sym_context_destroy(context); xair_module_destroy(module);
@@ -409,7 +433,59 @@ static void test_parallel_isolated_workers(void) {
     xair_sym_snapshot_destroy(snapshot); xair_sym_state_destroy(state); xair_sym_context_destroy(context); xair_module_destroy(module);
 }
 
+static void test_symbolic_and_taint_names_are_not_truncated(void) {
+    static const char symbol_name[] =
+        "symbolic_variable_name_that_is_longer_than_the_previous_forty_eight_character_limit_and_must_survive";
+    static const char taint_name[] =
+        "taint_source_name_that_is_longer_than_the_previous_forty_eight_character_limit_and_must_survive";
+    xair_sym_context *context = NULL;
+    xair_sym_expr_id expression;
+    xair_sym_expr_view expression_view;
+    xair_sym_taint_id taint;
+    xair_sym_taint_view taint_view;
+    require_sym(xair_sym_context_create(&context));
+    require_sym(xair_sym_symbol(context, 64, symbol_name, &expression));
+    require_sym(xair_sym_expr_get(context, expression, &expression_view));
+    assert(strcmp(expression_view.symbol, symbol_name) == 0);
+    require_sym(xair_sym_taint_source(context, taint_name, &taint));
+    require_sym(xair_sym_taint_get(context, taint, &taint_view));
+    assert(strcmp(taint_view.name, taint_name) == 0);
+    xair_sym_context_destroy(context);
+}
+
+static void test_solver_cancellation_reports_diagnostic(void) {
+    xair_module *module = NULL;
+    xair_sym_context *context = NULL;
+    xair_sym_state *state = NULL;
+    xair_cancel_token *token = NULL;
+    xair_analysis_options options;
+    xair_diagnostic diagnostic;
+    xair_sym_sat sat = XAIR_SYM_UNKNOWN;
+    xair_block_id block;
+
+    require_xair(xair_module_create(&module));
+    require_xair(xair_block_create(module, "entry", &block));
+    require_xair(xair_set_return(module, block, NULL, 0));
+    require_sym(xair_sym_context_create(&context));
+    require_sym(xair_sym_state_create(context, module, block, &state));
+    require_xair(xair_cancel_token_create(&token));
+    xair_cancel_token_request(token);
+    xair_analysis_options_init(&options);
+    options.cancel_token = token;
+    xair_sym_context_set_analysis_options(context, &options);
+    assert(xair_sym_check_ex(state, XAIR_SYM_INVALID_ID, &sat, &diagnostic) == XAIR_SYM_ERR_CANCELED);
+    assert(diagnostic.status == XAIR_ERR_CANCELED);
+    assert(diagnostic.stage == XAIR_STAGE_SOLVER);
+    assert(diagnostic.block == block);
+    xair_cancel_token_destroy(token);
+    xair_sym_state_destroy(state);
+    xair_sym_context_destroy(context);
+    xair_module_destroy(module);
+}
+
 int main(void) {
+    test_solver_cancellation_reports_diagnostic();
+    test_symbolic_and_taint_names_are_not_truncated();
     test_expression_interning_and_z3_model();
     test_symbolic_xair_branch_explores_both_paths();
     test_lazy_zero_flag_forks_symbolically();

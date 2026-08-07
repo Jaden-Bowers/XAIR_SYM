@@ -229,7 +229,7 @@ xair_sym_status xair_sym_environment_copy(
     if (environment == NULL || state == NULL || state->context != environment->context) return XAIR_SYM_ERR_BAD_ARG;
     for (i = 0; i < size; ++i) {
         xair_sym_expr_id value;
-        xair_sym_taint_id taint;
+        xair_sym_taint_id taint = XAIR_SYM_TAINT_NONE;
         xair_sym_status status = xair_sym_memory_load8(state, source + i, &value);
         if (status == XAIR_SYM_OK) status = xair_sym_memory_load_taint8(state, source + i, &taint);
         if (status == XAIR_SYM_OK) status = xair_sym_memory_store8(state, destination + i, value);

@@ -160,9 +160,9 @@ static xair_sym_status execute_memory(xair_sym_state *state, const xair_op_view 
             address_is_concrete = 1;
         }
         for (i = 0; i < bytes; ++i) {
-            xair_sym_expr_id byte;
+            xair_sym_expr_id byte = XAIR_SYM_INVALID_ID;
             if (address_is_concrete) {
-                xair_sym_taint_id byte_taint;
+                xair_sym_taint_id byte_taint = XAIR_SYM_TAINT_NONE;
                 status = xair_sym_memory_load8(state, address + i, &byte);
                 if (status == XAIR_SYM_OK) status = xair_sym_memory_load_taint8(state, address + i, &byte_taint);
                 if (status == XAIR_SYM_OK) status = xair_sym_taint_union(state->context, memory_taint, byte_taint, &memory_taint);
@@ -383,6 +383,8 @@ static void destroy_seen_states(xair_sym_seen_state *seen_states, size_t count) 
 
 void xair_sym_explore_options_init(xair_sym_explore_options *options) {
     if (options == NULL) return;
+    memset(options, 0, sizeof(*options));
+    xair_analysis_options_init(&options->analysis);
     options->max_states = 100000;
     options->max_block_steps = 1000000;
     options->max_visits_per_block = 1024;
@@ -392,8 +394,8 @@ void xair_sym_explore_options_init(xair_sym_explore_options *options) {
     options->cancel_token = NULL;
 }
 
-xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xair_sym_explore_options *options,
-    xair_sym_terminal_cb callback, void *user) {
+xair_sym_status xair_sym_explore_with_options_ex(xair_sym_state *initial, const xair_sym_explore_options *options,
+    xair_sym_terminal_cb callback, void *user, xair_analysis_result *result, xair_diagnostic *diagnostic) {
     xair_sym_state **queue = NULL;
     size_t queued = 0, capacity = 0, cursor = 0, steps = 0, processed = 0, symbolic_forks = 0;
     size_t *visits = NULL;
@@ -407,10 +409,28 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
     xair_opcode trace_opcode = XAIR_OP_ADD;
     int trace_opcode_valid = 0;
     uint8_t trace_in_terminator = 0u;
+    uint64_t started = xair_monotonic_milliseconds();
+    const xair_cancel_token *cancel_token;
+    int stopped_by_limit = 0;
+    int stopped_by_cancel = 0;
+    if (result != NULL) { memset(result, 0, sizeof(*result)); result->state = XAIR_ANALYSIS_FAILED; }
+    xair_diagnostic_init(diagnostic);
     if (initial == NULL || options == NULL || options->max_states == 0 || options->max_block_steps == 0 ||
         options->max_visits_per_block == 0 || options->search > XAIR_SYM_SEARCH_COVERAGE ||
-        options->execution_mode > XAIR_SYM_EXEC_HYBRID_CONCRETIZE) return XAIR_SYM_ERR_BAD_ARG;
+        options->execution_mode > XAIR_SYM_EXEC_HYBRID_CONCRETIZE) {
+        xair_diagnostic_set(diagnostic, XAIR_ERR_BAD_ARG, XAIR_STAGE_SYMBOLIC, 0, 0,
+            XAIR_INVALID_ID, XAIR_INVALID_ID, "invalid symbolic exploration options");
+        return XAIR_SYM_ERR_BAD_ARG;
+    }
+    cancel_token = options->analysis.cancel_token != NULL ? options->analysis.cancel_token : options->cancel_token;
     block_count = xair_module_block_count(initial->module);
+    if (options->analysis.max_ir_values != 0 &&
+        xair_module_value_count(initial->module) > options->analysis.max_ir_values) {
+        if (result != NULL) { result->state = XAIR_ANALYSIS_LIMITED; result->reason = XAIR_ERR_RESOURCE_LIMIT; }
+        xair_diagnostic_set(diagnostic, XAIR_ERR_RESOURCE_LIMIT, XAIR_STAGE_SYMBOLIC, 0, 0,
+            initial->block, XAIR_INVALID_ID, "symbolic IR value budget exceeded");
+        return XAIR_SYM_ERR_RESOURCE_LIMIT;
+    }
     visits = (size_t *)calloc(block_count != 0 ? block_count : 1, sizeof(*visits));
     if (visits == NULL) return XAIR_SYM_ERR_OOM;
     status = xair_sym_state_clone(initial, &state);
@@ -421,10 +441,22 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
     state = NULL;
     while (processed < options->max_states && steps < options->max_block_steps) {
         const xair_op_id *ops = NULL; size_t op_count, i; xair_term_view term;
-        if (xair_sym_cancel_token_requested(options->cancel_token)) break;
+        if (xair_cancel_token_requested(cancel_token)) { stopped_by_cancel = 1; break; }
+        if (options->analysis.max_wall_time != 0 &&
+            xair_monotonic_milliseconds() - started >= options->analysis.max_wall_time) {
+            stopped_by_limit = 1; break;
+        }
+        if (options->analysis.max_memory != 0 &&
+            (queued * sizeof(*queue) + seen_count * sizeof(*seen_states)) > options->analysis.max_memory) {
+            stopped_by_limit = 1; break;
+        }
         state = dequeue(queue, queued, &cursor, options->search, visits);
         if (state == NULL) break;
         processed++;
+        if (options->analysis.progress_callback != NULL) {
+            options->analysis.progress_callback(XAIR_STAGE_SYMBOLIC, processed,
+                options->max_states, options->analysis.progress_user);
+        }
         {
             int duplicate;
             status = remember_state(state, &seen_states, &seen_count, &seen_capacity, &duplicate);
@@ -436,6 +468,7 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
         }
         if (++visits[state->block] > options->max_visits_per_block) {
             state->context->stats.scheduler_pruned++;
+            stopped_by_limit = 1;
             xair_sym_state_destroy(state);
             state = NULL;
             continue;
@@ -552,27 +585,60 @@ xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xai
         xair_sym_state_destroy(state);
         state = NULL;
     }
+    if (!stopped_by_cancel && !stopped_by_limit &&
+        (processed >= options->max_states || steps >= options->max_block_steps)) stopped_by_limit = 1;
     for (cursor = 0; cursor < queued; ++cursor) xair_sym_state_destroy(queue[cursor]);
     free(visits);
     destroy_seen_states(seen_states, seen_count);
     free(queue);
+    if (result != NULL) {
+        result->completed = processed;
+        result->total = options->max_states;
+        result->elapsed_ms = xair_monotonic_milliseconds() - started;
+        result->state = stopped_by_cancel ? XAIR_ANALYSIS_CANCELED :
+            stopped_by_limit ? XAIR_ANALYSIS_LIMITED : XAIR_ANALYSIS_COMPLETE;
+        result->reason = stopped_by_cancel ? XAIR_ERR_CANCELED :
+            stopped_by_limit ? XAIR_ERR_RESOURCE_LIMIT : XAIR_OK;
+    }
+    if (stopped_by_cancel) {
+        xair_diagnostic_set(diagnostic, XAIR_ERR_CANCELED, XAIR_STAGE_SYMBOLIC, 0, 0,
+            trace_block, XAIR_INVALID_ID, "symbolic exploration canceled");
+        return XAIR_SYM_ERR_CANCELED;
+    }
+    if (stopped_by_limit) {
+        xair_diagnostic_set(diagnostic, XAIR_ERR_RESOURCE_LIMIT, XAIR_STAGE_SYMBOLIC, 0, 0,
+            trace_block, XAIR_INVALID_ID, "symbolic exploration limit reached");
+        return XAIR_SYM_ERR_RESOURCE_LIMIT;
+    }
     return XAIR_SYM_OK;
 fail:
-    if (getenv("XAIR_SYM_TRACE_FAILURES") != NULL) {
-        fprintf(stderr,
-            "xair_sym failure: status=%s block=%u phase=%s op_index=%zu opcode=%s\n",
-            xair_sym_status_name(status),
-            state != NULL ? state->block : trace_block,
-            trace_in_terminator ? "terminator" : "op",
-            trace_op_index,
-            trace_opcode_valid ? xair_opcode_name(trace_opcode) : "<invalid>");
-    }
+    (void)trace_in_terminator;
+    (void)trace_opcode_valid;
+    (void)trace_opcode;
+    xair_diagnostic_set(diagnostic,
+        status == XAIR_SYM_ERR_CANCELED ? XAIR_ERR_CANCELED :
+        status == XAIR_SYM_ERR_RESOURCE_LIMIT ? XAIR_ERR_RESOURCE_LIMIT : XAIR_ERR_INCOMPLETE,
+        XAIR_STAGE_SYMBOLIC, 0, (uint32_t)(trace_op_index == SIZE_MAX ? 0 : trace_op_index),
+        state != NULL ? state->block : trace_block, XAIR_INVALID_ID, xair_sym_status_name(status));
     xair_sym_state_destroy(state);
     for (cursor = 0; cursor < queued; ++cursor) xair_sym_state_destroy(queue[cursor]);
     free(visits);
     destroy_seen_states(seen_states, seen_count);
     free(queue);
+    if (result != NULL) {
+        result->state = status == XAIR_SYM_ERR_CANCELED ? XAIR_ANALYSIS_CANCELED :
+            status == XAIR_SYM_ERR_RESOURCE_LIMIT ? XAIR_ANALYSIS_LIMITED : XAIR_ANALYSIS_FAILED;
+        result->reason = diagnostic != NULL ? diagnostic->status : XAIR_ERR_INCOMPLETE;
+        result->elapsed_ms = xair_monotonic_milliseconds() - started;
+        result->completed = processed;
+        result->total = options->max_states;
+    }
     return status;
+}
+
+xair_sym_status xair_sym_explore_with_options(xair_sym_state *initial, const xair_sym_explore_options *options,
+    xair_sym_terminal_cb callback, void *user) {
+    return xair_sym_explore_with_options_ex(initial, options, callback, user, NULL, NULL);
 }
 
 xair_sym_status xair_sym_explore(xair_sym_state *initial, size_t max_states, size_t max_steps,

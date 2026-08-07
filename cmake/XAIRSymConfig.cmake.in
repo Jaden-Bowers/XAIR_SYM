@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(XAIR CONFIG)
+find_dependency(XAIRCFG CONFIG)
+find_dependency(Z3 CONFIG)
+include("${CMAKE_CURRENT_LIST_DIR}/XAIRSymTargets.cmake")
+check_required_components(XAIRSym)

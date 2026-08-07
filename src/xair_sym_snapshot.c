@@ -208,7 +208,7 @@ xair_sym_status xair_sym_snapshot_clone_isolated(
     xair_sym_context_set_taint_mode(context, source_context->taint_mode);
     for (i = 0; i < source_context->expression_count; ++i) {
         const xair_sym_expr *expression = source_context->expressions[i];
-        xair_sym_expr_id rebuilt;
+        xair_sym_expr_id rebuilt = XAIR_SYM_INVALID_ID;
         if (expression->kind == XAIR_SYM_EXPR_CONST) status = xair_sym_const(context, expression->bits, expression->immediate, &rebuilt);
         else if (expression->kind == XAIR_SYM_EXPR_SYMBOL) status = xair_sym_symbol(context, expression->bits, expression->symbol, &rebuilt);
         else if (expression->arg_count == 1) status = xair_sym_unary(context, expression->opcode, expression->bits,

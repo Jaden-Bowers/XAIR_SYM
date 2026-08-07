@@ -12,18 +12,13 @@ uint32_t xair_sym_version_u32(void) {
 }
 
 xair_sym_status xair_sym_cancel_token_create(xair_sym_cancel_token **out_token) {
-    xair_sym_cancel_token *token;
-    if (out_token == NULL) return XAIR_SYM_ERR_BAD_ARG;
-    token = (xair_sym_cancel_token *)malloc(sizeof(*token));
-    if (token == NULL) return XAIR_SYM_ERR_OOM;
-    atomic_init(&token->requested, 0); *out_token = token; return XAIR_SYM_OK;
+    xair_status status = xair_cancel_token_create(out_token);
+    return status == XAIR_OK ? XAIR_SYM_OK : status == XAIR_ERR_OOM ? XAIR_SYM_ERR_OOM : XAIR_SYM_ERR_BAD_ARG;
 }
-void xair_sym_cancel_token_destroy(xair_sym_cancel_token *token) { free(token); }
-void xair_sym_cancel_token_request(xair_sym_cancel_token *token) { if (token != NULL) atomic_store(&token->requested, 1); }
-void xair_sym_cancel_token_reset(xair_sym_cancel_token *token) { if (token != NULL) atomic_store(&token->requested, 0); }
-int xair_sym_cancel_token_requested(const xair_sym_cancel_token *token) {
-    return token != NULL && atomic_load(&token->requested);
-}
+void xair_sym_cancel_token_destroy(xair_sym_cancel_token *token) { xair_cancel_token_destroy(token); }
+void xair_sym_cancel_token_request(xair_sym_cancel_token *token) { xair_cancel_token_request(token); }
+void xair_sym_cancel_token_reset(xair_sym_cancel_token *token) { xair_cancel_token_reset(token); }
+int xair_sym_cancel_token_requested(const xair_sym_cancel_token *token) { return xair_cancel_token_requested(token); }
 
 static uint64_t mix(uint64_t hash, uint64_t value) {
     hash ^= value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6u) + (hash >> 2u);
@@ -33,6 +28,8 @@ static uint64_t mix(uint64_t hash, uint64_t value) {
 static void *arena_allocate(xair_sym_context *context, size_t size) {
     xair_sym_arena_chunk *chunk = context->arena;
     size_t aligned = (size + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
+    if (context->analysis.max_memory != 0 &&
+        (aligned > context->analysis.max_memory || context->arena_bytes > context->analysis.max_memory - aligned)) return NULL;
     if (chunk == NULL || aligned > chunk->capacity - chunk->used) {
         size_t capacity = aligned > 65536 ? aligned : 65536;
         chunk = (xair_sym_arena_chunk *)malloc(sizeof(*chunk) + capacity);
@@ -42,6 +39,7 @@ static void *arena_allocate(xair_sym_context *context, size_t size) {
     {
         void *result = chunk->data + chunk->used;
         chunk->used += aligned;
+        context->arena_bytes += aligned;
         return result;
     }
 }
@@ -49,7 +47,7 @@ static void *arena_allocate(xair_sym_context *context, size_t size) {
 static uint64_t expr_hash(const xair_sym_expr *expr) {
     uint64_t hash = UINT64_C(0x5841495253594d31);
     size_t i;
-    const unsigned char *text = (const unsigned char *)expr->symbol;
+    const unsigned char *text = (const unsigned char *)(expr->symbol == NULL ? "" : expr->symbol);
 
     hash = mix(hash, (uint64_t)expr->kind);
     hash = mix(hash, (uint64_t)expr->opcode);
@@ -70,7 +68,8 @@ static int expr_equal(const xair_sym_expr *lhs, const xair_sym_expr *rhs) {
         lhs->bits == rhs->bits && lhs->arg_count == rhs->arg_count &&
         lhs->immediate == rhs->immediate &&
         memcmp(lhs->args, rhs->args, sizeof(lhs->args)) == 0 &&
-        strcmp(lhs->symbol, rhs->symbol) == 0;
+        strcmp(lhs->symbol == NULL ? "" : lhs->symbol,
+            rhs->symbol == NULL ? "" : rhs->symbol) == 0;
 }
 
 static xair_sym_status reserve(void **data, size_t element, size_t *capacity, size_t needed) {
@@ -130,6 +129,8 @@ xair_sym_status xair_sym_intern(xair_sym_context *context, const xair_sym_expr *
     if (context == NULL || key == NULL || out_expr == NULL || key->bits == 0 || key->bits > 128) {
         return XAIR_SYM_ERR_BAD_ARG;
     }
+    if (context->analysis.max_ir_values != 0 &&
+        context->expression_count >= context->analysis.max_ir_values) return XAIR_SYM_ERR_RESOURCE_LIMIT;
     candidate = *key;
     candidate.hash = expr_hash(&candidate);
     candidate.dependencies = 0;
@@ -170,7 +171,15 @@ xair_sym_status xair_sym_intern(xair_sym_context *context, const xair_sym_expr *
     *out_expr = (xair_sym_expr_id)context->expression_count;
     context->expressions[context->expression_count] = (xair_sym_expr *)arena_allocate(context, sizeof(candidate));
     if (context->expressions[context->expression_count] == NULL) return XAIR_SYM_ERR_OOM;
-    *context->expressions[context->expression_count++] = candidate;
+    *context->expressions[context->expression_count] = candidate;
+    if (candidate.symbol != NULL) {
+        size_t symbol_size = strlen(candidate.symbol) + 1u;
+        char *symbol_copy = (char *)arena_allocate(context, symbol_size);
+        if (symbol_copy == NULL) return XAIR_SYM_ERR_OOM;
+        memcpy(symbol_copy, candidate.symbol, symbol_size);
+        context->expressions[context->expression_count]->symbol = symbol_copy;
+    }
+    context->expression_count++;
     context->hash[slot].used = 1;
     context->hash[slot].hash = candidate.hash;
     context->hash[slot].expr = *out_expr;
@@ -197,7 +206,10 @@ void xair_sym_context_destroy(xair_sym_context *context) {
         xair_sym_arena_chunk *chunk = context->arena;
         size_t taint_i;
         while (chunk != NULL) { xair_sym_arena_chunk *next = chunk->next; free(chunk); chunk = next; }
-        for (taint_i = 0; taint_i < context->taint_count; ++taint_i) free(context->taints[taint_i]);
+        for (taint_i = 0; taint_i < context->taint_count; ++taint_i) {
+            free(context->taints[taint_i]->name);
+            free(context->taints[taint_i]);
+        }
         free(context->taints);
         free(context->query_cache);
         free(context->model_cache);
@@ -211,6 +223,13 @@ void xair_sym_context_stats(const xair_sym_context *context, xair_sym_stats *out
     if (context != NULL && out_stats != NULL) {
         *out_stats = context->stats;
     }
+}
+
+void xair_sym_context_set_analysis_options(
+    xair_sym_context *context, const xair_analysis_options *options) {
+    if (context == NULL) return;
+    if (options == NULL) xair_analysis_options_init(&context->analysis);
+    else context->analysis = *options;
 }
 
 static uint64_t mask_bits(uint16_t bits) {
@@ -234,7 +253,7 @@ xair_sym_status xair_sym_symbol(xair_sym_context *context, uint16_t bits, const 
     memset(&expr, 0, sizeof(expr));
     expr.kind = XAIR_SYM_EXPR_SYMBOL;
     expr.bits = bits;
-    (void)snprintf(expr.symbol, sizeof(expr.symbol), "%s", name);
+    expr.symbol = name;
     return xair_sym_intern(context, &expr, out_expr);
 }
 
@@ -332,6 +351,6 @@ xair_sym_status xair_sym_expr_get(const xair_sym_context *context, xair_sym_expr
 }
 
 const char *xair_sym_status_name(xair_sym_status status) {
-    static const char *names[] = {"ok", "out of memory", "bad argument", "range error", "unsupported", "solver error", "infeasible"};
+    static const char *names[] = {"ok", "out of memory", "bad argument", "range error", "unsupported", "solver error", "infeasible", "resource limit", "canceled", "solver timeout", "solver unknown", "internal invariant failure"};
     return (unsigned)status < sizeof(names) / sizeof(names[0]) ? names[status] : "unknown";
 }

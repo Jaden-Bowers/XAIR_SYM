@@ -11,6 +11,24 @@ typedef struct {
     uint8_t *defined;
 } z3_translation;
 
+typedef struct {
+    Z3_context context;
+    const xair_cancel_token *token;
+    xair_atomic_bool finished;
+} z3_cancel_monitor;
+
+static int monitor_solver_cancellation(void *opaque) {
+    z3_cancel_monitor *monitor = (z3_cancel_monitor *)opaque;
+    while (!xair_atomic_bool_load(&monitor->finished)) {
+        if (xair_cancel_token_requested(monitor->token)) {
+            Z3_interrupt(monitor->context);
+            break;
+        }
+        xair_sleep_milliseconds(1);
+    }
+    return 0;
+}
+
 static uint64_t query_mix(uint64_t hash, uint64_t value) {
     return hash ^ (value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6u) + (hash >> 2u));
 }
@@ -195,9 +213,13 @@ xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id ex
     xair_sym_sat *out_sat, xair_sym_expr_id model_symbol, uint64_t *out_model) {
     Z3_config config; Z3_context context; Z3_solver solver; Z3_lbool checked;
     z3_translation translation; xair_sym_constraint *constraint_node; xair_sym_status status = XAIR_SYM_OK;
+    z3_cancel_monitor monitor;
+    xair_thread monitor_thread;
+    int monitor_started = 0;
     uint64_t dependencies;
     uint64_t cache_key;
     if (state == NULL || out_sat == NULL) return XAIR_SYM_ERR_BAD_ARG;
+    if (xair_cancel_token_requested(state->context->analysis.cancel_token)) return XAIR_SYM_ERR_CANCELED;
     if (extra != XAIR_SYM_INVALID_ID && extra >= state->context->expression_count) return XAIR_SYM_ERR_BAD_ARG;
     dependencies = query_dependencies(state, extra);
     cache_key = query_key(state, extra, dependencies);
@@ -213,6 +235,15 @@ xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id ex
     translation.defined = (uint8_t *)calloc(state->context->expression_count, 1);
     if (translation.cache == NULL || translation.defined == NULL) { status = XAIR_SYM_ERR_OOM; goto done; }
     solver = Z3_mk_solver(context); Z3_solver_inc_ref(context, solver);
+    if (state->context->analysis.max_wall_time != 0) {
+        Z3_params params = Z3_mk_params(context);
+        unsigned timeout = state->context->analysis.max_wall_time > UINT32_MAX ?
+            UINT32_MAX : (unsigned)state->context->analysis.max_wall_time;
+        Z3_params_inc_ref(context, params);
+        Z3_params_set_uint(context, params, Z3_mk_string_symbol(context, "timeout"), timeout);
+        Z3_solver_set_params(context, solver, params);
+        Z3_params_dec_ref(context, params);
+    }
     for (constraint_node = state->constraints; constraint_node != NULL; constraint_node = constraint_node->parent) {
         if (!constraint_selected(state, constraint_node, dependencies)) {
             state->context->stats.constraints_sliced++;
@@ -228,10 +259,41 @@ xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id ex
         if (condition == NULL) { status = XAIR_SYM_ERR_UNSUPPORTED; goto solver_done; }
         Z3_solver_assert(context, solver, as_bool(context, condition));
     }
-    state->context->stats.solver_queries++; checked = Z3_solver_check(context, solver);
+    if (state->context->analysis.cancel_token != NULL) {
+        monitor.context = context;
+        monitor.token = state->context->analysis.cancel_token;
+        xair_atomic_bool_init(&monitor.finished, 0);
+        if (!xair_thread_create(&monitor_thread, monitor_solver_cancellation, &monitor)) {
+            status = XAIR_SYM_ERR_INTERNAL;
+            goto solver_done;
+        }
+        monitor_started = 1;
+    }
+    state->context->stats.solver_queries++;
+    checked = Z3_solver_check(context, solver);
+    if (monitor_started) {
+        int ignored;
+        xair_atomic_bool_store(&monitor.finished, 1);
+        (void)xair_thread_join(&monitor_thread, &ignored);
+        monitor_started = 0;
+    }
+    if (xair_cancel_token_requested(state->context->analysis.cancel_token)) {
+        status = XAIR_SYM_ERR_CANCELED;
+        goto solver_done;
+    }
     if (checked == Z3_L_TRUE) { *out_sat = XAIR_SYM_SAT; state->context->stats.solver_sat++; }
     else if (checked == Z3_L_FALSE) { *out_sat = XAIR_SYM_UNSAT; state->context->stats.solver_unsat++; }
-    else *out_sat = XAIR_SYM_UNKNOWN;
+    else {
+        const char *reason = Z3_solver_get_reason_unknown(context, solver);
+        *out_sat = XAIR_SYM_UNKNOWN;
+        status = reason != NULL && strstr(reason, "timeout") != NULL ?
+            XAIR_SYM_ERR_SOLVER_TIMEOUT : XAIR_SYM_ERR_SOLVER_UNKNOWN;
+        goto solver_done;
+    }
+    if (xair_cancel_token_requested(state->context->analysis.cancel_token)) {
+        status = XAIR_SYM_ERR_CANCELED;
+        goto solver_done;
+    }
     if (out_model == NULL) {
         status = query_cache_insert(state->context, cache_key,
             state->constraints == NULL ? 0 : state->constraints->identity, extra, *out_sat);
@@ -245,6 +307,11 @@ xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id ex
         Z3_model_dec_ref(context, model);
     }
 solver_done:
+    if (monitor_started) {
+        int ignored;
+        xair_atomic_bool_store(&monitor.finished, 1);
+        (void)xair_thread_join(&monitor_thread, &ignored);
+    }
     Z3_solver_dec_ref(context, solver);
 done:
     free(translation.defined); free(translation.cache); Z3_del_context(context); return status;
@@ -252,6 +319,25 @@ done:
 
 xair_sym_status xair_sym_check(xair_sym_state *state, xair_sym_expr_id extra, xair_sym_sat *out_sat) {
     return xair_sym_solver_check(state, extra, out_sat, XAIR_SYM_INVALID_ID, NULL);
+}
+
+xair_sym_status xair_sym_check_ex(
+    xair_sym_state *state,
+    xair_sym_expr_id extra,
+    xair_sym_sat *out_sat,
+    xair_diagnostic *diagnostic) {
+    xair_sym_status status;
+    xair_diagnostic_init(diagnostic);
+    status = xair_sym_solver_check(state, extra, out_sat, XAIR_SYM_INVALID_ID, NULL);
+    if (status != XAIR_SYM_OK) {
+        xair_status reason = status == XAIR_SYM_ERR_CANCELED ? XAIR_ERR_CANCELED :
+            status == XAIR_SYM_ERR_SOLVER_TIMEOUT ? XAIR_ERR_SOLVER_TIMEOUT :
+            status == XAIR_SYM_ERR_SOLVER_UNKNOWN ? XAIR_ERR_SOLVER_UNKNOWN : XAIR_ERR_INCOMPLETE;
+        xair_diagnostic_set(diagnostic, reason, XAIR_STAGE_SOLVER, 0, 0,
+            state == NULL ? XAIR_INVALID_ID : state->block, XAIR_INVALID_ID,
+            xair_sym_status_name(status));
+    }
+    return status;
 }
 
 xair_sym_status xair_sym_model_u64(xair_sym_state *state, xair_sym_expr_id symbol, uint64_t *out_value) {

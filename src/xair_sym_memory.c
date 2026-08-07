@@ -65,6 +65,7 @@ xair_sym_status xair_sym_object_add(xair_sym_state *state, uint64_t base, size_t
     if (state == NULL || out_object == NULL || size == 0 || base > UINT64_MAX - (size - 1)) return XAIR_SYM_ERR_BAD_ARG;
     status = xair_sym_memory_make_unique(state); if (status != XAIR_SYM_OK) return status;
     if (find_object(state->memory, base) != NULL || find_object(state->memory, base + size - 1) != NULL) return XAIR_SYM_ERR_BAD_ARG;
+    if (size > SIZE_MAX / (sizeof(xair_sym_expr_id) + sizeof(xair_sym_taint_id))) return XAIR_SYM_ERR_RESOURCE_LIMIT;
     if (state->memory->count == state->memory->capacity) {
         capacity = state->memory->capacity == 0 ? 4 : state->memory->capacity * 2;
         next = (xair_sym_object *)realloc(state->memory->objects, capacity * sizeof(*next));
@@ -72,11 +73,23 @@ xair_sym_status xair_sym_object_add(xair_sym_state *state, uint64_t base, size_t
         state->memory->objects = next; state->memory->capacity = capacity;
     }
     if (state->memory->count >= UINT32_MAX) return XAIR_SYM_ERR_RANGE;
+    {
+        size_t allocation = size * (sizeof(xair_sym_expr_id) + sizeof(xair_sym_taint_id));
+        if (state->context->analysis.max_memory != 0 &&
+            (allocation > state->context->analysis.max_memory ||
+                state->context->object_bytes > state->context->analysis.max_memory - allocation)) {
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        }
+        state->context->object_bytes += allocation;
+    }
     next = &state->memory->objects[state->memory->count]; memset(next, 0, sizeof(*next));
     next->base = base; next->size = size; next->permissions = permissions;
     next->bytes = (xair_sym_expr_id *)malloc(size * sizeof(*next->bytes));
     next->taints = (xair_sym_taint_id *)calloc(size, sizeof(*next->taints));
-    if (next->bytes == NULL || next->taints == NULL) { free(next->taints); free(next->bytes); return XAIR_SYM_ERR_OOM; }
+    if (next->bytes == NULL || next->taints == NULL) {
+        state->context->object_bytes -= size * (sizeof(xair_sym_expr_id) + sizeof(xair_sym_taint_id));
+        free(next->taints); free(next->bytes); return XAIR_SYM_ERR_OOM;
+    }
     for (capacity = 0; capacity < size; ++capacity) next->bytes[capacity] = XAIR_SYM_INVALID_ID;
     *out_object = (xair_sym_object_id)state->memory->count++;
     state->context->stats.memory_objects++;

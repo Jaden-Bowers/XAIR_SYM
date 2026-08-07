@@ -1,14 +1,13 @@
 #include "xair_sym_internal.h"
 
 #include <stdlib.h>
-#include <threads.h>
 
 typedef struct {
     const xair_sym_snapshot *snapshot;
     xair_sym_explore_options explore;
     xair_sym_terminal_cb callback;
     void *user;
-    mtx_t *callback_lock;
+    xair_mutex *callback_lock;
     xair_sym_status status;
     size_t worker_index;
 } xair_sym_worker;
@@ -16,16 +15,16 @@ typedef struct {
 typedef struct {
     xair_sym_terminal_cb callback;
     void *user;
-    mtx_t *lock;
+    xair_mutex *lock;
 } synchronized_callback;
 
 static xair_sym_status invoke_synchronized(xair_sym_state *state, void *user) {
     synchronized_callback *callback = (synchronized_callback *)user;
     xair_sym_status status;
     if (callback->callback == NULL) return XAIR_SYM_OK;
-    if (mtx_lock(callback->lock) != thrd_success) return XAIR_SYM_ERR_BAD_ARG;
+    xair_mutex_lock(callback->lock);
     status = callback->callback(state, callback->user);
-    (void)mtx_unlock(callback->lock);
+    xair_mutex_unlock(callback->lock);
     return status;
 }
 
@@ -59,28 +58,28 @@ xair_sym_status xair_sym_parallel_explore(
     const xair_sym_parallel_options *options,
     xair_sym_terminal_cb callback,
     void *user) {
-    thrd_t *threads;
+    xair_thread *threads;
     xair_sym_worker *workers;
-    mtx_t callback_lock;
+    xair_mutex callback_lock;
     size_t created = 0;
     size_t i;
     xair_sym_status status = XAIR_SYM_OK;
     if (snapshot == NULL || options == NULL || options->workers == 0 || options->workers > 256) return XAIR_SYM_ERR_BAD_ARG;
-    threads = (thrd_t *)calloc(options->workers, sizeof(*threads));
+    threads = (xair_thread *)calloc(options->workers, sizeof(*threads));
     workers = (xair_sym_worker *)calloc(options->workers, sizeof(*workers));
     if (threads == NULL || workers == NULL) { free(workers); free(threads); return XAIR_SYM_ERR_OOM; }
-    if (mtx_init(&callback_lock, mtx_plain) != thrd_success) { free(workers); free(threads); return XAIR_SYM_ERR_BAD_ARG; }
+    if (!xair_mutex_init(&callback_lock)) { free(workers); free(threads); return XAIR_SYM_ERR_BAD_ARG; }
     for (i = 0; i < options->workers; ++i) {
         workers[i].snapshot = snapshot; workers[i].explore = options->explore;
         workers[i].callback = callback; workers[i].user = user; workers[i].callback_lock = &callback_lock;
         workers[i].worker_index = i; workers[i].status = XAIR_SYM_ERR_BAD_ARG;
-        if (thrd_create(&threads[i], run_worker, &workers[i]) != thrd_success) { status = XAIR_SYM_ERR_BAD_ARG; break; }
+        if (!xair_thread_create(&threads[i], run_worker, &workers[i])) { status = XAIR_SYM_ERR_BAD_ARG; break; }
         created++;
     }
     for (i = 0; i < created; ++i) {
         int ignored;
-        if (thrd_join(threads[i], &ignored) != thrd_success && status == XAIR_SYM_OK) status = XAIR_SYM_ERR_BAD_ARG;
+        if (!xair_thread_join(&threads[i], &ignored) && status == XAIR_SYM_OK) status = XAIR_SYM_ERR_BAD_ARG;
         if (workers[i].status != XAIR_SYM_OK && status == XAIR_SYM_OK) status = workers[i].status;
     }
-    mtx_destroy(&callback_lock); free(workers); free(threads); return status;
+    xair_mutex_destroy(&callback_lock); free(workers); free(threads); return status;
 }

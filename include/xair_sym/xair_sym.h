@@ -9,7 +9,7 @@ extern "C" {
 
 #define XAIR_SYM_INVALID_ID UINT32_MAX
 #define XAIR_SYM_VERSION_MAJOR 0u
-#define XAIR_SYM_VERSION_MINOR 4u
+#define XAIR_SYM_VERSION_MINOR 5u
 #define XAIR_SYM_VERSION_PATCH 0u
 
 typedef uint32_t xair_sym_expr_id;
@@ -25,7 +25,12 @@ typedef enum {
     XAIR_SYM_ERR_RANGE,
     XAIR_SYM_ERR_UNSUPPORTED,
     XAIR_SYM_ERR_SOLVER,
-    XAIR_SYM_ERR_INFEASIBLE
+    XAIR_SYM_ERR_INFEASIBLE,
+    XAIR_SYM_ERR_RESOURCE_LIMIT,
+    XAIR_SYM_ERR_CANCELED,
+    XAIR_SYM_ERR_SOLVER_TIMEOUT,
+    XAIR_SYM_ERR_SOLVER_UNKNOWN,
+    XAIR_SYM_ERR_INTERNAL
 } xair_sym_status;
 
 typedef enum {
@@ -104,9 +109,10 @@ typedef enum {
     XAIR_SYM_EXEC_HYBRID_CONCRETIZE
 } xair_sym_execution_mode;
 
-typedef struct xair_sym_cancel_token xair_sym_cancel_token;
+typedef xair_cancel_token xair_sym_cancel_token;
 
 typedef struct {
+    xair_analysis_options analysis;
     size_t max_states;
     size_t max_block_steps;
     size_t max_visits_per_block;
@@ -139,6 +145,7 @@ typedef struct {
 } xair_sym_trace_branch;
 
 typedef struct {
+    xair_analysis_options analysis;
     uint64_t stack_base;
     size_t stack_size;
     size_t max_segment_size;
@@ -166,6 +173,8 @@ typedef struct {
 xair_sym_status xair_sym_context_create(xair_sym_context **out_context);
 void xair_sym_context_destroy(xair_sym_context *context);
 void xair_sym_context_stats(const xair_sym_context *context, xair_sym_stats *out_stats);
+void xair_sym_context_set_analysis_options(
+    xair_sym_context *context, const xair_analysis_options *options);
 void xair_sym_context_set_taint_mode(xair_sym_context *context, xair_sym_taint_mode mode);
 
 xair_sym_status xair_sym_taint_source(
@@ -225,6 +234,9 @@ xair_sym_status xair_sym_memory_load_taint8(
 
 xair_sym_status xair_sym_check(
     xair_sym_state *state, xair_sym_expr_id extra_condition, xair_sym_sat *out_sat);
+xair_sym_status xair_sym_check_ex(
+    xair_sym_state *state, xair_sym_expr_id extra_condition, xair_sym_sat *out_sat,
+    xair_diagnostic *diagnostic);
 xair_sym_status xair_sym_model_u64(
     xair_sym_state *state, xair_sym_expr_id symbol, uint64_t *out_value);
 xair_sym_status xair_sym_model_bytes(
@@ -308,6 +320,10 @@ void xair_sym_explore_options_init(xair_sym_explore_options *options);
 xair_sym_status xair_sym_explore_with_options(
     xair_sym_state *initial, const xair_sym_explore_options *options,
     xair_sym_terminal_cb callback, void *user);
+xair_sym_status xair_sym_explore_with_options_ex(
+    xair_sym_state *initial, const xair_sym_explore_options *options,
+    xair_sym_terminal_cb callback, void *user,
+    xair_analysis_result *result, xair_diagnostic *diagnostic);
 
 xair_block_id xair_sym_state_block(const xair_sym_state *state);
 const char *xair_sym_status_name(xair_sym_status status);

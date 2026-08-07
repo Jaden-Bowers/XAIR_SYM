@@ -6,6 +6,12 @@ cancellation, resource limits, Unknown values, faults, and Opaque operations mus
 follow that contract; any baseline gap listed there makes dependent results
 explicitly incomplete.
 
+The component now uses the sibling-aware
+[`xair` unified build](../xair/docs/building.md), including source-built static
+Z3. Symbolic contexts are thread-confined, parallel workers are isolated, and
+cancellation tokens are shared atomics as defined by
+[`thread-safety.md`](../xair/docs/thread-safety.md).
+
 XAIR Symbolic is a C library for symbolic execution and object-based symbolic
 memory over frozen XAIR modules and XAIR CFGs. It is a separate project from the
 IR generator and CFG recovery engine and consumes their public C APIs.
