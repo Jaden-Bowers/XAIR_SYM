@@ -16,8 +16,7 @@ XAIR Symbolic is a C library for symbolic execution and object-based symbolic
 memory over frozen XAIR modules and XAIR CFGs. It is a separate project from the
 IR generator and CFG recovery engine and consumes their public C APIs.
 
-Current version: 0.5.0. Blocks A through E are complete at the native runtime
-baseline.
+Current version: 0.6.0. The Phase 6 symbolic-readiness architecture is enabled.
 
 Implemented:
 
@@ -28,8 +27,8 @@ Implemented:
 - Persistent path constraints through cloned execution states.
 - Symbolic interpretation of scalar XAIR operations.
 - Feasibility-checked conditional path forking over frozen XAIR modules.
-- Object-based memory with bounds, permissions, sparse symbolic bytes, and
-  copy-on-write state cloning.
+- Sorted interval memory with lazy file-backed objects, sparse 4 KiB symbolic
+  pages, separate taint overlays, and page-level copy-on-write.
 - Concrete-address loads and stores through XAIR memory operations.
 - Bounded symbolic byte-address loads and stores over known memory objects,
   encoded as guarded value summaries with explicit in-bounds constraints.
@@ -56,12 +55,16 @@ Implemented:
   provenance-preserving memory copies.
 - Versioned Linux, Windows, and Windows-driver model classification for common
   allocation, input, copy, termination, probing, and completion APIs.
+- Structured custom-model inspection and updates for ABI, arguments, taint,
+  distinct call-site/target provenance, model confidence, results, memory,
+  constraints, completeness, and termination.
 - Versioned module-fingerprinted state snapshots with deterministic in-memory
   restoration and bounded file loading.
 - Snapshot preservation of values, constraints, taint, control taint, memory
   objects, permissions, symbolic bytes, and provenance IDs.
-- Context-isolated parallel search workers with private expression stores,
-  solver contexts, caches, and compiled dispatch plans.
+- Deterministic disjoint first-symbol partitions with shared global state,
+  step, fork, coverage, and dynamically reserved memory budgets plus
+  structural terminal deduplication.
 - Synchronized C callbacks and atomic cancellation tokens for parallel runs.
 - Predecoded immutable block plans that remove repeated public IR inspection
   and operation decoding from the execution loop.
@@ -71,10 +74,10 @@ The production implementation and public API are C. There is no Python runtime
 or Python orchestration layer. Z3 is an external solver dependency used through
 its C API.
 
-The current memory bootstrap resolves concrete addresses directly and bounded
-symbolic byte addresses through guarded object-byte summaries. Wide symbolic
-accesses and scalable index representations belong to later optimization work.
-Unsupported semantic forms return an explicit status.
+Concrete addresses resolve through the interval index. Symbolic byte addresses
+use bounded finite-domain guarded summaries and return an explicit resource
+limit before scanning a large address space. Wide accesses compose page-backed
+bytes without allocating expressions for untouched mapped data.
 
 The process model maps the binary segments supplied by `xair_binary_view`, then
 adds a deterministic stack and initializes entry parameters by their frozen IR
@@ -83,15 +86,19 @@ filesystem state, and full kernel object graphs remain explicit later
 environment work. Unknown external calls are reported as unknown models rather
 than being assigned unconstrained behavior silently.
 
-Snapshot files use schema `XAIRSN01` and are checked against both the frozen
-XAIR module fingerprint and the current symbolic-context signature. File
-restoration therefore requires the same expression and provenance universe.
-Isolated workers rebuild that universe deterministically in private contexts.
+Snapshot files use sparse, checksummed schema `XAIRSN03`. They validate IR and
+binary fingerprints, symbolic and memory-model versions, ABI, model-library
+version, options and completeness. Saves use a temporary file and atomic
+replacement, so an interrupted save cannot truncate the prior snapshot.
 
-Parallel execution currently runs a search portfolio with BFS, DFS, and
-coverage-new workers. Terminal callbacks may observe the same terminal state
-from more than one policy. Cross-worker frontier stealing and result
-deduplication remain later scaling work.
+Parallel execution splits the first symbolic input domain into disjoint modulo
+partitions. Each partition has an isolated context, and the requested global
+state, step, and fork limits use shared counters; memory is reserved against a
+shared process-wide limit and reports its peak across workers. Terminal
+identity is compared structurally (including values, taint, and memory), not by
+a collision-prone hash. Isolated clones reconstruct the owned built-in model
+environment. Dynamic callback registries are explicitly unsupported for
+parallel isolation because raw process-local callback pointers are not copied.
 
 The compiled block path is a predecoded C dispatch plan, not a native-code JIT.
 It removes repeated IR accessor calls while retaining one symbolic-semantics

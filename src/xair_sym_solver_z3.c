@@ -1,6 +1,7 @@
 #include "xair_sym_internal.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <z3.h>
 
@@ -10,6 +11,307 @@ typedef struct {
     Z3_ast *cache;
     uint8_t *defined;
 } z3_translation;
+
+typedef struct {
+    Z3_context context;
+    Z3_solver solver;
+    Z3_ast *cache;
+    uint8_t *defined;
+    size_t capacity;
+    uint64_t estimated_bytes;
+    size_t parallel_memory_reserved;
+    size_t parallel_z3_reserved;
+} z3_runtime;
+
+#define XAIR_SYM_PARALLEL_SOLVER_LEASE_MAX (UINT64_C(32) * UINT64_C(1024) * UINT64_C(1024))
+
+static xair_once z3_process_lock_once = XAIR_ONCE_INIT;
+static xair_mutex z3_process_lock;
+static int z3_process_lock_ready;
+
+xair_sym_status xair_sym_solver_model_values(xair_sym_state *state,
+    const xair_sym_expr_id *symbols, size_t count, uint64_t *out_lo, uint64_t *out_hi);
+
+static void initialize_z3_process_lock(void) {
+    z3_process_lock_ready = xair_mutex_init(&z3_process_lock);
+}
+
+static int lock_z3_process(void) {
+    xair_call_once(&z3_process_lock_once, initialize_z3_process_lock);
+    if (!z3_process_lock_ready) return 0;
+    xair_mutex_lock(&z3_process_lock);
+    return 1;
+}
+
+static size_t add_saturating(size_t lhs, size_t rhs) {
+    return lhs > SIZE_MAX - rhs ? SIZE_MAX : lhs + rhs;
+}
+
+static size_t mul_saturating(size_t lhs, size_t rhs) {
+    return lhs != 0 && rhs > SIZE_MAX / lhs ? SIZE_MAX : lhs * rhs;
+}
+
+static size_t context_memory_maximum(const xair_sym_context *source) {
+    if (source->analysis.max_memory != 0) return source->analysis.max_memory;
+    return source->parallel_budget == NULL ? 0 : source->parallel_budget->max_memory;
+}
+
+static int parallel_memory_tracking(const xair_sym_context *source) {
+    return source->parallel_budget != NULL && source->parallel_budget->max_memory != 0;
+}
+
+static size_t context_owned_bytes(const xair_sym_context *source, size_t solver_cache_capacity) {
+    size_t total = add_saturating(sizeof(*source), sizeof(z3_runtime));
+    total = add_saturating(total, source->arena_capacity_bytes);
+    total = add_saturating(total, source->object_bytes);
+    total = add_saturating(total, mul_saturating(source->expression_capacity, sizeof(*source->expressions)));
+    total = add_saturating(total, mul_saturating(source->hash_capacity, sizeof(*source->hash)));
+    total = add_saturating(total, mul_saturating(source->taint_capacity, sizeof(*source->taints)));
+    total = add_saturating(total, mul_saturating(source->query_cache_capacity, sizeof(*source->query_cache)));
+    total = add_saturating(total, mul_saturating(source->model_cache_capacity, sizeof(*source->model_cache)));
+    total = add_saturating(total, mul_saturating(solver_cache_capacity, sizeof(Z3_ast)));
+    total = add_saturating(total, solver_cache_capacity);
+    return total;
+}
+
+static xair_sym_status runtime_get(xair_sym_context *source, uint64_t *z3_allowance,
+    z3_runtime **out_runtime) {
+    z3_runtime *runtime = (z3_runtime *)source->solver_runtime;
+    if (runtime == NULL) {
+        Z3_config config = Z3_mk_config();
+        size_t maximum = context_memory_maximum(source);
+        size_t owned = context_owned_bytes(source, 0);
+        if (maximum != 0 && owned >= maximum) {
+            Z3_del_config(config);
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        }
+        if (!xair_sym_parallel_memory_reserve(source, sizeof(*runtime))) {
+            Z3_del_config(config);
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        }
+        runtime = (z3_runtime *)calloc(1, sizeof(*runtime));
+        if (runtime == NULL) {
+            xair_sym_parallel_memory_release(source, sizeof(*runtime));
+            Z3_del_config(config);
+            return XAIR_SYM_ERR_OOM;
+        }
+        runtime->parallel_memory_reserved = parallel_memory_tracking(source) ? sizeof(*runtime) : 0;
+        {
+            uint64_t allocation_baseline = Z3_get_estimated_alloc_size();
+        runtime->context = Z3_mk_context(config);
+        Z3_del_config(config);
+        if (runtime->context == NULL) {
+            xair_sym_parallel_memory_release(source, runtime->parallel_memory_reserved);
+            free(runtime);
+            return XAIR_SYM_ERR_SOLVER;
+        }
+        runtime->solver = Z3_mk_solver(runtime->context);
+        if (runtime->solver == NULL) {
+            Z3_del_context(runtime->context);
+            xair_sym_parallel_memory_release(source, runtime->parallel_memory_reserved);
+            free(runtime);
+            return XAIR_SYM_ERR_SOLVER;
+        }
+        Z3_solver_inc_ref(runtime->context, runtime->solver);
+        {
+            uint64_t current = Z3_get_estimated_alloc_size();
+            uint64_t used = current > allocation_baseline ? current - allocation_baseline : 0;
+            uint64_t remaining = maximum == 0 ? UINT64_MAX : (uint64_t)(maximum - owned);
+            if ((maximum != 0 && used > remaining) ||
+                (parallel_memory_tracking(source) && (used > *z3_allowance || used > SIZE_MAX))) {
+                Z3_solver_dec_ref(runtime->context, runtime->solver);
+                Z3_del_context(runtime->context);
+                xair_sym_parallel_memory_release(source, runtime->parallel_memory_reserved);
+                free(runtime);
+                return XAIR_SYM_ERR_RESOURCE_LIMIT;
+            }
+            runtime->estimated_bytes = used;
+            if (parallel_memory_tracking(source)) {
+                runtime->parallel_z3_reserved = (size_t)used;
+                runtime->parallel_memory_reserved = add_saturating(
+                    runtime->parallel_memory_reserved, (size_t)used);
+                *z3_allowance -= used;
+            }
+        }
+        }
+        source->solver_runtime = runtime;
+    }
+    if (runtime->capacity < source->expression_count) {
+        size_t capacity = runtime->capacity == 0 ? 64 : runtime->capacity;
+        Z3_ast *cache;
+        uint8_t *defined;
+        size_t allocation;
+        size_t additional;
+        while (capacity < source->expression_count) {
+            if (capacity > SIZE_MAX / 2) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+            capacity *= 2;
+        }
+        if (context_memory_maximum(source) != 0 &&
+            context_owned_bytes(source, capacity) > context_memory_maximum(source))
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        allocation = mul_saturating(capacity, sizeof(*cache));
+        allocation = add_saturating(allocation, capacity);
+        additional = mul_saturating(capacity - runtime->capacity, sizeof(*cache));
+        additional = add_saturating(additional, capacity - runtime->capacity);
+        if (allocation == SIZE_MAX || additional == SIZE_MAX ||
+            !xair_sym_parallel_memory_reserve(source, allocation))
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        cache = (Z3_ast *)calloc(capacity, sizeof(*cache));
+        defined = (uint8_t *)calloc(capacity, sizeof(*defined));
+        if (cache == NULL || defined == NULL) {
+            free(defined);
+            free(cache);
+            xair_sym_parallel_memory_release(source, allocation);
+            return XAIR_SYM_ERR_OOM;
+        }
+        if (runtime->capacity != 0) {
+            memcpy(cache, runtime->cache, runtime->capacity * sizeof(*cache));
+            memcpy(defined, runtime->defined, runtime->capacity * sizeof(*defined));
+        }
+        free(runtime->cache);
+        free(runtime->defined);
+        xair_sym_parallel_memory_release(source, allocation - additional);
+        runtime->cache = cache;
+        runtime->defined = defined;
+        runtime->capacity = capacity;
+        if (parallel_memory_tracking(source))
+            runtime->parallel_memory_reserved = add_saturating(runtime->parallel_memory_reserved, additional);
+    }
+    *out_runtime = runtime;
+    return XAIR_SYM_OK;
+}
+
+static xair_sym_status solver_limit_params(xair_sym_context *source, z3_runtime *runtime,
+    uint64_t z3_allowance, unsigned *out_timeout, unsigned *out_memory_mb,
+    uint64_t *out_memory_limit) {
+    const uint64_t mib = UINT64_C(1024) * UINT64_C(1024);
+    uint64_t timeout = UINT32_MAX;
+    uint64_t memory_mb = UINT32_MAX;
+    uint64_t memory_limit = UINT64_MAX;
+    size_t maximum = context_memory_maximum(source);
+    if (source->analysis.max_wall_time != 0) {
+        uint64_t elapsed = xair_monotonic_milliseconds() - source->analysis_started_ms;
+        if (elapsed >= source->analysis.max_wall_time) return XAIR_SYM_ERR_SOLVER_TIMEOUT;
+        timeout = source->analysis.max_wall_time - elapsed;
+        if (timeout > UINT32_MAX) timeout = UINT32_MAX;
+    }
+    if (maximum != 0) {
+        size_t owned = context_owned_bytes(source, runtime->capacity);
+        uint64_t remaining;
+        if (owned >= maximum) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        remaining = (uint64_t)(maximum - owned);
+        if (runtime->estimated_bytes >= remaining) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        remaining -= runtime->estimated_bytes;
+        if (z3_allowance != 0 && z3_allowance < remaining) remaining = z3_allowance;
+        if (Z3_get_estimated_alloc_size() > UINT64_MAX - remaining)
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        memory_limit = Z3_get_estimated_alloc_size() + remaining;
+        memory_mb = memory_limit / mib;
+        if (memory_mb == 0 || Z3_get_estimated_alloc_size() > memory_limit)
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        if (memory_mb > UINT32_MAX) memory_mb = UINT32_MAX;
+    }
+    *out_timeout = (unsigned)timeout;
+    *out_memory_mb = (unsigned)memory_mb;
+    *out_memory_limit = memory_limit;
+    return XAIR_SYM_OK;
+}
+
+static void solver_runtime_destroy_unlocked(xair_sym_context *source) {
+    z3_runtime *runtime;
+    if (source == NULL || source->solver_runtime == NULL) return;
+    runtime = (z3_runtime *)source->solver_runtime;
+    Z3_solver_dec_ref(runtime->context, runtime->solver);
+    free(runtime->defined);
+    free(runtime->cache);
+    Z3_del_context(runtime->context);
+    xair_sym_parallel_memory_release(source, runtime->parallel_memory_reserved);
+    free(runtime);
+    source->solver_runtime = NULL;
+}
+
+static xair_sym_status parallel_solver_lease(xair_sym_context *source, uint64_t *out_lease) {
+    const uint64_t mib = UINT64_C(1024) * UINT64_C(1024);
+    size_t maximum;
+    size_t owned;
+    uint64_t lease;
+    *out_lease = 0;
+    if (source->parallel_budget == NULL || source->parallel_budget->max_memory == 0)
+        return XAIR_SYM_OK;
+    if (source->solver_runtime != NULL &&
+        ((z3_runtime *)source->solver_runtime)->parallel_memory_reserved == 0)
+        solver_runtime_destroy_unlocked(source);
+    maximum = context_memory_maximum(source);
+    owned = context_owned_bytes(source,
+        source->solver_runtime == NULL ? 0 : ((z3_runtime *)source->solver_runtime)->capacity);
+    if (owned >= maximum) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+    if (source->solver_runtime != NULL) {
+        z3_runtime *runtime = (z3_runtime *)source->solver_runtime;
+        if (runtime->estimated_bytes >= (uint64_t)(maximum - owned))
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        owned += (size_t)runtime->estimated_bytes;
+    }
+    if (maximum - owned < mib) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+    lease = (uint64_t)(maximum - owned);
+    if (lease > XAIR_SYM_PARALLEL_SOLVER_LEASE_MAX)
+        lease = XAIR_SYM_PARALLEL_SOLVER_LEASE_MAX;
+    lease = (lease / mib) * mib;
+    while (lease >= mib) {
+        if (lease <= SIZE_MAX && xair_sym_parallel_memory_reserve(source, (size_t)lease)) {
+            *out_lease = lease;
+            return XAIR_SYM_OK;
+        }
+        lease = ((lease / 2u) / mib) * mib;
+    }
+    return XAIR_SYM_ERR_RESOURCE_LIMIT;
+}
+
+static xair_sym_status runtime_account_query(xair_sym_context *source, z3_runtime *runtime,
+    uint64_t allocation_baseline, uint64_t *z3_allowance) {
+    uint64_t current = Z3_get_estimated_alloc_size();
+    uint64_t estimate = runtime->estimated_bytes;
+    size_t maximum = context_memory_maximum(source);
+    if (current >= allocation_baseline) {
+        uint64_t increase = current - allocation_baseline;
+        if (increase > UINT64_MAX - estimate) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        estimate += increase;
+        if (maximum != 0) {
+            size_t owned = context_owned_bytes(source, runtime->capacity);
+            if (owned >= maximum || estimate > (uint64_t)(maximum - owned))
+                return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        }
+        if (parallel_memory_tracking(source) && increase != 0) {
+            if (increase > *z3_allowance || increase > SIZE_MAX ||
+                runtime->parallel_memory_reserved > SIZE_MAX - (size_t)increase ||
+                runtime->parallel_z3_reserved > SIZE_MAX - (size_t)increase)
+                return XAIR_SYM_ERR_RESOURCE_LIMIT;
+            runtime->parallel_memory_reserved += (size_t)increase;
+            runtime->parallel_z3_reserved += (size_t)increase;
+            *z3_allowance -= increase;
+        }
+    } else {
+        uint64_t decrease = allocation_baseline - current;
+        size_t released;
+        estimate = decrease >= estimate ? 0 : estimate - decrease;
+        released = decrease >= runtime->parallel_z3_reserved ?
+            runtime->parallel_z3_reserved : (size_t)decrease;
+        runtime->parallel_z3_reserved -= released;
+        runtime->parallel_memory_reserved -= released;
+        xair_sym_parallel_memory_release(source, released);
+    }
+    runtime->estimated_bytes = estimate;
+    return XAIR_SYM_OK;
+}
+
+void xair_sym_solver_runtime_destroy(xair_sym_context *source) {
+    if (source == NULL || source->solver_runtime == NULL) return;
+    if (!lock_z3_process()) {
+        solver_runtime_destroy_unlocked(source);
+        return;
+    }
+    solver_runtime_destroy_unlocked(source);
+    xair_mutex_unlock(&z3_process_lock);
+}
 
 typedef struct {
     Z3_context context;
@@ -78,9 +380,31 @@ static int query_cache_lookup(xair_sym_context *context, uint64_t key, uint64_t 
 }
 
 static xair_sym_status query_cache_rebuild(xair_sym_context *context, size_t capacity) {
-    xair_sym_query_cache_entry *entries = (xair_sym_query_cache_entry *)calloc(capacity, sizeof(*entries));
+    xair_sym_query_cache_entry *entries;
+    size_t allocation;
+    size_t previous;
+    size_t maximum = context_memory_maximum(context);
+    size_t owned = context_owned_bytes(context,
+        context->solver_runtime == NULL ? 0 : ((z3_runtime *)context->solver_runtime)->capacity);
     size_t i;
-    if (entries == NULL) return XAIR_SYM_ERR_OOM;
+    if (capacity == 0 || capacity > SIZE_MAX / sizeof(*entries))
+        return XAIR_SYM_ERR_RESOURCE_LIMIT;
+    allocation = capacity * sizeof(*entries);
+    previous = context->query_cache_capacity * sizeof(*entries);
+    if (context->solver_runtime != NULL) {
+        uint64_t z3_owned = ((z3_runtime *)context->solver_runtime)->estimated_bytes;
+        if (z3_owned > SIZE_MAX - owned) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        owned += (size_t)z3_owned;
+    }
+    if (maximum != 0 && (owned >= maximum || allocation > maximum - owned))
+        return XAIR_SYM_ERR_RESOURCE_LIMIT;
+    if (!xair_sym_parallel_memory_reserve(context, allocation))
+        return XAIR_SYM_ERR_RESOURCE_LIMIT;
+    entries = (xair_sym_query_cache_entry *)calloc(capacity, sizeof(*entries));
+    if (entries == NULL) {
+        xair_sym_parallel_memory_release(context, allocation);
+        return XAIR_SYM_ERR_OOM;
+    }
     for (i = 0; i < context->query_cache_capacity; ++i) {
         if (context->query_cache[i].used) {
             size_t slot = (size_t)(context->query_cache[i].key & (capacity - 1));
@@ -88,7 +412,10 @@ static xair_sym_status query_cache_rebuild(xair_sym_context *context, size_t cap
             entries[slot] = context->query_cache[i];
         }
     }
-    free(context->query_cache); context->query_cache = entries; context->query_cache_capacity = capacity;
+    free(context->query_cache);
+    xair_sym_parallel_memory_release(context, previous);
+    context->query_cache = entries;
+    context->query_cache_capacity = capacity;
     return XAIR_SYM_OK;
 }
 
@@ -98,7 +425,9 @@ static xair_sym_status query_cache_insert(xair_sym_context *context, uint64_t ke
     xair_sym_status status;
     if (result == XAIR_SYM_UNKNOWN) return XAIR_SYM_OK;
     if (context->query_cache_capacity == 0 || (context->query_cache_count + 1) * 10 >= context->query_cache_capacity * 7) {
-        status = query_cache_rebuild(context, context->query_cache_capacity == 0 ? 64 : context->query_cache_capacity * 2);
+        size_t capacity = context->query_cache_capacity == 0 ? 64 : context->query_cache_capacity * 2;
+        if (capacity < context->query_cache_capacity) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        status = query_cache_rebuild(context, capacity);
         if (status != XAIR_SYM_OK) return status;
     }
     slot = (size_t)(key & (context->query_cache_capacity - 1));
@@ -115,6 +444,26 @@ static xair_sym_status query_cache_insert(xair_sym_context *context, uint64_t ke
 
 static Z3_ast translate(z3_translation *translation, xair_sym_expr_id id);
 
+static Z3_ast unknown_flag(z3_translation *translation, const xair_sym_expr *flags,
+    xair_opcode opcode) {
+    char name[80];
+    (void)snprintf(name, sizeof(name), "undefined_flag_%016llx_%u",
+        (unsigned long long)flags->hash, (unsigned)opcode);
+    return Z3_mk_const(translation->context, Z3_mk_string_symbol(translation->context, name),
+        Z3_mk_bv_sort(translation->context, 1));
+}
+
+static Z3_ast shift_defined(z3_translation *translation, Z3_ast rhs, Z3_sort sort,
+    uint16_t bits) {
+    Z3_ast zero = Z3_mk_unsigned_int64(translation->context, 0, sort);
+    Z3_ast width = Z3_mk_unsigned_int64(translation->context, bits, sort);
+    Z3_ast clauses[2] = {
+        Z3_mk_not(translation->context, Z3_mk_eq(translation->context, rhs, zero)),
+        Z3_mk_bvult(translation->context, rhs, width)
+    };
+    return Z3_mk_and(translation->context, 2, clauses);
+}
+
 static Z3_ast bv1_from_bool(Z3_context context, Z3_ast condition) {
     Z3_sort sort = Z3_mk_bv_sort(context, 1);
     Z3_ast one = Z3_mk_unsigned_int64(context, 1, sort);
@@ -127,14 +476,26 @@ static Z3_ast as_bool(Z3_context context, Z3_ast value) {
     return Z3_mk_eq(context, value, Z3_mk_unsigned_int64(context, 1, sort));
 }
 
-static Z3_ast translate_flag(z3_translation *translation, const xair_sym_expr *extract) {
-    const xair_sym_expr *flags = translation->source->expressions[extract->args[0]];
+static Z3_ast translate_flag_pack(z3_translation *translation, xair_sym_expr_id flags_id,
+    xair_opcode extract_opcode) {
+    const xair_sym_expr *flags = translation->source->expressions[flags_id];
     Z3_ast lhs, rhs = NULL, result;
     Z3_ast zero, lhs_sign, rhs_sign = NULL, result_sign;
     Z3_sort sort;
     uint16_t bits;
 
     if (flags->kind != XAIR_SYM_EXPR_XAIR || flags->arg_count == 0) return NULL;
+    if (flags->opcode == XAIR_OP_SELECT && flags->arg_count == 3) {
+        Z3_ast condition = translate(translation, flags->args[0]);
+        Z3_ast when_true = translate_flag_pack(translation, flags->args[1], extract_opcode);
+        Z3_ast when_false = translate_flag_pack(translation, flags->args[2], extract_opcode);
+        Z3_sort condition_sort = Z3_mk_bv_sort(translation->context, 1);
+        if (condition == NULL || when_true == NULL || when_false == NULL) return NULL;
+        return Z3_mk_ite(translation->context,
+            Z3_mk_eq(translation->context, condition,
+                Z3_mk_unsigned_int64(translation->context, 1, condition_sort)),
+            when_true, when_false);
+    }
     lhs = translate(translation, flags->args[0]);
     if (lhs == NULL) return NULL;
     bits = translation->source->expressions[flags->args[0]]->bits;
@@ -153,18 +514,33 @@ static Z3_ast translate_flag(z3_translation *translation, const xair_sym_expr *e
     if (result == NULL) return NULL;
     sort = Z3_get_sort(translation->context, result);
     zero = Z3_mk_unsigned_int64(translation->context, 0, sort);
-    switch (extract->opcode) {
+    switch (extract_opcode) {
     case XAIR_OP_FLAG_ZF:
-        return bv1_from_bool(translation->context, Z3_mk_eq(translation->context, result, zero));
+        {
+            Z3_ast value = bv1_from_bool(translation->context, Z3_mk_eq(translation->context, result, zero));
+            return flags->opcode == XAIR_OP_FLAGS_SHL ? Z3_mk_ite(translation->context,
+                shift_defined(translation, rhs, sort, bits), value,
+                unknown_flag(translation, flags, extract_opcode)) : value;
+        }
     case XAIR_OP_FLAG_SF:
-        return Z3_mk_extract(translation->context, bits - 1u, bits - 1u, result);
+        {
+            Z3_ast value = Z3_mk_extract(translation->context, bits - 1u, bits - 1u, result);
+            return flags->opcode == XAIR_OP_FLAGS_SHL ? Z3_mk_ite(translation->context,
+                shift_defined(translation, rhs, sort, bits), value,
+                unknown_flag(translation, flags, extract_opcode)) : value;
+        }
     case XAIR_OP_FLAG_PF: {
         Z3_ast parity = Z3_mk_extract(translation->context, 0, 0, result);
         unsigned i;
         for (i = 1; i < 8u && i < bits; ++i) parity = Z3_mk_bvxor(translation->context, parity,
             Z3_mk_extract(translation->context, i, i, result));
-        return bv1_from_bool(translation->context, Z3_mk_eq(translation->context, parity,
-            Z3_mk_unsigned_int64(translation->context, 0, Z3_mk_bv_sort(translation->context, 1))));
+        {
+            Z3_ast value = bv1_from_bool(translation->context, Z3_mk_eq(translation->context, parity,
+                Z3_mk_unsigned_int64(translation->context, 0, Z3_mk_bv_sort(translation->context, 1))));
+            return flags->opcode == XAIR_OP_FLAGS_SHL ? Z3_mk_ite(translation->context,
+                shift_defined(translation, rhs, sort, bits), value,
+                unknown_flag(translation, flags, extract_opcode)) : value;
+        }
     }
     case XAIR_OP_FLAG_CF:
         if (flags->opcode == XAIR_OP_FLAGS_LOGIC) return Z3_mk_unsigned_int64(translation->context, 0,
@@ -176,8 +552,12 @@ static Z3_ast translate_flag(z3_translation *translation, const xair_sym_expr *e
         {
             Z3_ast width = Z3_mk_unsigned_int64(translation->context, bits, sort);
             Z3_ast amount = Z3_mk_bvsub(translation->context, width, rhs);
-            return Z3_mk_extract(translation->context, 0, 0,
-                Z3_mk_bvlshr(translation->context, lhs, amount));
+            {
+                Z3_ast value = Z3_mk_extract(translation->context, 0, 0,
+                    Z3_mk_bvlshr(translation->context, lhs, amount));
+                return Z3_mk_ite(translation->context, shift_defined(translation, rhs, sort, bits),
+                    value, unknown_flag(translation, flags, extract_opcode));
+            }
         }
     case XAIR_OP_FLAG_OF:
         if (flags->opcode == XAIR_OP_FLAGS_LOGIC) return Z3_mk_unsigned_int64(translation->context, 0,
@@ -188,7 +568,13 @@ static Z3_ast translate_flag(z3_translation *translation, const xair_sym_expr *e
             Z3_ast width = Z3_mk_unsigned_int64(translation->context, bits, sort);
             Z3_ast cf = Z3_mk_extract(translation->context, 0, 0, Z3_mk_bvlshr(translation->context, lhs,
                 Z3_mk_bvsub(translation->context, width, rhs)));
-            return Z3_mk_bvxor(translation->context, result_sign, cf);
+            {
+                Z3_ast one = Z3_mk_unsigned_int64(translation->context, 1, sort);
+                return Z3_mk_ite(translation->context,
+                    Z3_mk_eq(translation->context, rhs, one),
+                    Z3_mk_bvxor(translation->context, result_sign, cf),
+                    unknown_flag(translation, flags, extract_opcode));
+            }
         }
         rhs_sign = Z3_mk_extract(translation->context, bits - 1u, bits - 1u, rhs);
         return bv1_from_bool(translation->context,
@@ -198,7 +584,8 @@ static Z3_ast translate_flag(z3_translation *translation, const xair_sym_expr *e
                     Z3_mk_not(translation->context, Z3_mk_eq(translation->context, lhs_sign, rhs_sign)),
                 Z3_mk_not(translation->context, Z3_mk_eq(translation->context, lhs_sign, result_sign)) }));
     case XAIR_OP_FLAG_AF:
-        if (flags->opcode == XAIR_OP_FLAGS_LOGIC || flags->opcode == XAIR_OP_FLAGS_SHL) return NULL;
+        if (flags->opcode == XAIR_OP_FLAGS_LOGIC || flags->opcode == XAIR_OP_FLAGS_SHL)
+            return unknown_flag(translation, flags, extract_opcode);
         return Z3_mk_bvxor(translation->context,
             Z3_mk_bvxor(translation->context, Z3_mk_extract(translation->context, 4, 4, lhs),
                 Z3_mk_extract(translation->context, 4, 4, rhs)),
@@ -207,7 +594,15 @@ static Z3_ast translate_flag(z3_translation *translation, const xair_sym_expr *e
     }
 }
 
+static Z3_ast translate_flag(z3_translation *translation, const xair_sym_expr *extract) {
+    return translate_flag_pack(translation, extract->args[0], extract->opcode);
+}
+
 static Z3_ast translate_xair(z3_translation *t, const xair_sym_expr *expr) {
+    if (expr->opcode == XAIR_OP_FLAG_ZF || expr->opcode == XAIR_OP_FLAG_CF ||
+        expr->opcode == XAIR_OP_FLAG_OF || expr->opcode == XAIR_OP_FLAG_SF ||
+        expr->opcode == XAIR_OP_FLAG_PF || expr->opcode == XAIR_OP_FLAG_AF)
+        return translate_flag(t, expr);
     Z3_ast a = expr->arg_count > 0 ? translate(t, expr->args[0]) : NULL;
     Z3_ast b = expr->arg_count > 1 ? translate(t, expr->args[1]) : NULL;
     Z3_ast c = expr->arg_count > 2 ? translate(t, expr->args[2]) : NULL;
@@ -246,13 +641,6 @@ static Z3_ast translate_xair(z3_translation *t, const xair_sym_expr *expr) {
         return expr->opcode == XAIR_OP_ADDR_ADD ? Z3_mk_bvadd(t->context, a, b) : Z3_mk_bvsub(t->context, a, b);
     case XAIR_OP_INT_TO_ADDR:
     case XAIR_OP_ADDR_TO_INT: return a;
-    case XAIR_OP_FLAG_ZF:
-    case XAIR_OP_FLAG_CF:
-    case XAIR_OP_FLAG_OF:
-    case XAIR_OP_FLAG_SF:
-    case XAIR_OP_FLAG_PF:
-    case XAIR_OP_FLAG_AF:
-        return translate_flag(t, expr);
     default: return NULL;
     }
 }
@@ -273,7 +661,7 @@ static Z3_ast translate(z3_translation *t, xair_sym_expr_id id) {
     Z3_sort sort;
     Z3_ast ast;
     if (id >= t->source->expression_count) return NULL;
-    if (t->defined[id]) return t->cache[id];
+    if (t->defined[id]) { t->source->stats.solver_translation_hits++; return t->cache[id]; }
     expr = t->source->expressions[id]; sort = Z3_mk_bv_sort(t->context, expr->bits);
     if (expr->kind == XAIR_SYM_EXPR_CONST) ast = translate_constant(t, expr, sort);
     else if (expr->kind == XAIR_SYM_EXPR_SYMBOL) ast = Z3_mk_const(t->context,
@@ -283,38 +671,77 @@ static Z3_ast translate(z3_translation *t, xair_sym_expr_id id) {
     return ast;
 }
 
-xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id extra,
-    xair_sym_sat *out_sat, xair_sym_expr_id model_symbol, uint64_t *out_model) {
-    Z3_config config; Z3_context context; Z3_solver solver; Z3_lbool checked;
+static xair_sym_status solver_query(xair_sym_state *state, xair_sym_expr_id extra,
+    xair_sym_sat *out_sat, const xair_sym_expr_id *model_symbols, size_t model_count,
+    uint64_t *out_model_lo, uint64_t *out_model_hi) {
+    Z3_context context; Z3_solver solver; Z3_lbool checked;
+    z3_runtime *runtime = NULL;
     z3_translation translation; xair_sym_constraint *constraint_node; xair_sym_status status = XAIR_SYM_OK;
     z3_cancel_monitor monitor;
     xair_thread monitor_thread;
     int monitor_started = 0;
     uint64_t dependencies;
-    uint64_t cache_key;
-    if (state == NULL || out_sat == NULL) return XAIR_SYM_ERR_BAD_ARG;
+    uint64_t cache_key, query_started, memory_limit = UINT64_MAX;
+    uint64_t query_allocation_baseline = 0;
+    uint64_t parallel_lease = 0;
+    unsigned solver_timeout = UINT32_MAX, solver_memory_mb = UINT32_MAX;
+    int process_locked = 0;
+    size_t model_index;
+    if (out_sat != NULL) *out_sat = XAIR_SYM_UNKNOWN;
+    if (state == NULL || out_sat == NULL ||
+        (model_count != 0 && (model_symbols == NULL || out_model_lo == NULL || out_model_hi == NULL)))
+        return XAIR_SYM_ERR_BAD_ARG;
+    for (model_index = 0; model_index < model_count; ++model_index) {
+        out_model_lo[model_index] = 0;
+        out_model_hi[model_index] = 0;
+    }
     if (xair_cancel_token_requested(state->context->analysis.cancel_token)) return XAIR_SYM_ERR_CANCELED;
     if (extra != XAIR_SYM_INVALID_ID && extra >= state->context->expression_count) return XAIR_SYM_ERR_BAD_ARG;
+    for (model_index = 0; model_index < model_count; ++model_index)
+        if (model_symbols[model_index] >= state->context->expression_count) return XAIR_SYM_ERR_BAD_ARG;
     dependencies = query_dependencies(state, extra);
     cache_key = query_key(state, extra, dependencies);
-    if (out_model == NULL && query_cache_lookup(state->context, cache_key,
+    if (model_count == 0 && query_cache_lookup(state->context, cache_key,
         state->constraints == NULL ? 0 : state->constraints->identity, extra, out_sat)) {
         state->context->stats.solver_cache_hits++;
         return XAIR_SYM_OK;
     }
-    config = Z3_mk_config(); context = Z3_mk_context(config); Z3_del_config(config);
-    if (context == NULL) return XAIR_SYM_ERR_SOLVER;
+    if (!lock_z3_process()) return XAIR_SYM_ERR_INTERNAL;
+    process_locked = 1;
+    status = parallel_solver_lease(state->context, &parallel_lease);
+    if (status != XAIR_SYM_OK) {
+        state->context->stats.solver_unknown++;
+        xair_mutex_unlock(&z3_process_lock);
+        return status;
+    }
+    status = runtime_get(state->context, &parallel_lease, &runtime);
+    if (status != XAIR_SYM_OK) {
+        if (status == XAIR_SYM_ERR_RESOURCE_LIMIT) state->context->stats.solver_unknown++;
+        if (context_memory_maximum(state->context) != 0)
+            solver_runtime_destroy_unlocked(state->context);
+        xair_sym_parallel_memory_release(state->context, (size_t)parallel_lease);
+        xair_mutex_unlock(&z3_process_lock);
+        return status;
+    }
+    context = runtime->context;
+    solver = runtime->solver;
+    query_allocation_baseline = Z3_get_estimated_alloc_size();
+    Z3_solver_reset(context, solver);
     memset(&translation, 0, sizeof(translation)); translation.source = state->context; translation.context = context;
-    translation.cache = (Z3_ast *)calloc(state->context->expression_count, sizeof(*translation.cache));
-    translation.defined = (uint8_t *)calloc(state->context->expression_count, 1);
-    if (translation.cache == NULL || translation.defined == NULL) { status = XAIR_SYM_ERR_OOM; goto done; }
-    solver = Z3_mk_solver(context); Z3_solver_inc_ref(context, solver);
-    if (state->context->analysis.max_wall_time != 0) {
+    translation.cache = runtime->cache;
+    translation.defined = runtime->defined;
+    status = solver_limit_params(state->context, runtime, parallel_lease,
+        &solver_timeout, &solver_memory_mb, &memory_limit);
+    if (status != XAIR_SYM_OK) {
+        if (status == XAIR_SYM_ERR_SOLVER_TIMEOUT) state->context->stats.solver_timeouts++;
+        else if (status == XAIR_SYM_ERR_RESOURCE_LIMIT) state->context->stats.solver_unknown++;
+        goto solver_done;
+    }
+    {
         Z3_params params = Z3_mk_params(context);
-        unsigned timeout = state->context->analysis.max_wall_time > UINT32_MAX ?
-            UINT32_MAX : (unsigned)state->context->analysis.max_wall_time;
         Z3_params_inc_ref(context, params);
-        Z3_params_set_uint(context, params, Z3_mk_string_symbol(context, "timeout"), timeout);
+        Z3_params_set_uint(context, params, Z3_mk_string_symbol(context, "timeout"), solver_timeout);
+        Z3_params_set_uint(context, params, Z3_mk_string_symbol(context, "max_memory"), solver_memory_mb);
         Z3_solver_set_params(context, solver, params);
         Z3_params_dec_ref(context, params);
     }
@@ -327,11 +754,21 @@ xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id ex
         if (constraint == NULL) { status = XAIR_SYM_ERR_UNSUPPORTED; goto solver_done; }
         Z3_solver_assert(context, solver, as_bool(context, constraint));
         state->context->stats.constraints_submitted++;
+        if (Z3_get_estimated_alloc_size() > memory_limit) {
+            state->context->stats.solver_unknown++;
+            status = XAIR_SYM_ERR_RESOURCE_LIMIT;
+            goto solver_done;
+        }
     }
     if (extra != XAIR_SYM_INVALID_ID) {
         Z3_ast condition = translate(&translation, extra);
         if (condition == NULL) { status = XAIR_SYM_ERR_UNSUPPORTED; goto solver_done; }
         Z3_solver_assert(context, solver, as_bool(context, condition));
+        if (Z3_get_estimated_alloc_size() > memory_limit) {
+            state->context->stats.solver_unknown++;
+            status = XAIR_SYM_ERR_RESOURCE_LIMIT;
+            goto solver_done;
+        }
     }
     if (state->context->analysis.cancel_token != NULL) {
         monitor.context = context;
@@ -344,7 +781,13 @@ xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id ex
         monitor_started = 1;
     }
     state->context->stats.solver_queries++;
+    query_started = xair_monotonic_milliseconds();
     checked = Z3_solver_check(context, solver);
+    {
+        uint64_t duration = xair_monotonic_milliseconds() - query_started;
+        state->context->stats.solver_query_ms_total += duration;
+        if (duration > state->context->stats.solver_query_ms_max) state->context->stats.solver_query_ms_max = duration;
+    }
     if (monitor_started) {
         int ignored;
         xair_atomic_bool_store(&monitor.finished, 1);
@@ -360,24 +803,50 @@ xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id ex
     else {
         const char *reason = Z3_solver_get_reason_unknown(context, solver);
         *out_sat = XAIR_SYM_UNKNOWN;
-        status = reason != NULL && strstr(reason, "timeout") != NULL ?
-            XAIR_SYM_ERR_SOLVER_TIMEOUT : XAIR_SYM_ERR_SOLVER_UNKNOWN;
+        if (reason != NULL && strstr(reason, "timeout") != NULL)
+            status = XAIR_SYM_ERR_SOLVER_TIMEOUT;
+        else if (reason != NULL && (strstr(reason, "memory") != NULL || strstr(reason, "max. memory") != NULL))
+            status = XAIR_SYM_ERR_RESOURCE_LIMIT;
+        else
+            status = XAIR_SYM_ERR_SOLVER_UNKNOWN;
+        if (status == XAIR_SYM_ERR_SOLVER_TIMEOUT) state->context->stats.solver_timeouts++;
+        else state->context->stats.solver_unknown++;
         goto solver_done;
     }
     if (xair_cancel_token_requested(state->context->analysis.cancel_token)) {
         status = XAIR_SYM_ERR_CANCELED;
         goto solver_done;
     }
-    if (out_model == NULL) {
+    if (model_count == 0) {
         status = query_cache_insert(state->context, cache_key,
             state->constraints == NULL ? 0 : state->constraints->identity, extra, *out_sat);
         if (status != XAIR_SYM_OK) goto solver_done;
     }
-    if (out_model != NULL && model_symbol != XAIR_SYM_INVALID_ID && checked == Z3_L_TRUE) {
-        Z3_model model = Z3_solver_get_model(context, solver); Z3_ast symbol = translate(&translation, model_symbol); Z3_ast value;
+    if (model_count != 0 && checked == Z3_L_TRUE) {
+        Z3_model model = Z3_solver_get_model(context, solver);
         Z3_model_inc_ref(context, model);
-        if (symbol == NULL || !Z3_model_eval(context, model, symbol, true, &value) ||
-            !Z3_get_numeral_uint64(context, value, out_model)) status = XAIR_SYM_ERR_SOLVER;
+        for (model_index = 0; model_index < model_count; ++model_index) {
+            uint16_t bits = state->context->expressions[model_symbols[model_index]]->bits;
+            Z3_ast symbol = translate(&translation, model_symbols[model_index]);
+            Z3_ast low = symbol;
+            Z3_ast high = NULL;
+            Z3_ast value;
+            if (symbol == NULL) { status = XAIR_SYM_ERR_UNSUPPORTED; break; }
+            if (bits > 64) {
+                low = Z3_mk_extract(context, 63u, 0u, symbol);
+                high = Z3_mk_extract(context, bits - 1u, 64u, symbol);
+            }
+            if (!Z3_model_eval(context, model, low, true, &value) ||
+                !Z3_get_numeral_uint64(context, value, &out_model_lo[model_index])) {
+                status = XAIR_SYM_ERR_SOLVER;
+                break;
+            }
+            if (high != NULL && (!Z3_model_eval(context, model, high, true, &value) ||
+                !Z3_get_numeral_uint64(context, value, &out_model_hi[model_index]))) {
+                status = XAIR_SYM_ERR_SOLVER;
+                break;
+            }
+        }
         Z3_model_dec_ref(context, model);
     }
 solver_done:
@@ -386,9 +855,52 @@ solver_done:
         xair_atomic_bool_store(&monitor.finished, 1);
         (void)xair_thread_join(&monitor_thread, &ignored);
     }
-    Z3_solver_dec_ref(context, solver);
-done:
-    free(translation.defined); free(translation.cache); Z3_del_context(context); return status;
+    if (status == XAIR_SYM_ERR_CANCELED) state->context->stats.solver_canceled++;
+    {
+        xair_sym_status accounting = runtime_account_query(state->context, runtime,
+            query_allocation_baseline, &parallel_lease);
+        if (accounting != XAIR_SYM_OK) {
+            if (status != XAIR_SYM_ERR_RESOURCE_LIMIT)
+                state->context->stats.solver_unknown++;
+            status = accounting;
+        }
+    }
+    if (status == XAIR_SYM_ERR_RESOURCE_LIMIT)
+        solver_runtime_destroy_unlocked(state->context);
+    xair_sym_parallel_memory_release(state->context, (size_t)parallel_lease);
+    if (process_locked) xair_mutex_unlock(&z3_process_lock);
+    return status;
+}
+
+xair_sym_status xair_sym_solver_check(xair_sym_state *state, xair_sym_expr_id extra,
+    xair_sym_sat *out_sat, xair_sym_expr_id model_symbol, uint64_t *out_model) {
+    uint64_t high = 0;
+    if (out_model == NULL)
+        return solver_query(state, extra, out_sat, NULL, 0, NULL, NULL);
+    return solver_query(state, extra, out_sat, &model_symbol, 1, out_model, &high);
+}
+
+xair_sym_status xair_sym_solver_model_values(xair_sym_state *state,
+    const xair_sym_expr_id *symbols, size_t count, uint64_t *out_lo, uint64_t *out_hi) {
+    xair_sym_sat sat;
+    xair_sym_status status = solver_query(state, XAIR_SYM_INVALID_ID, &sat,
+        symbols, count, out_lo, out_hi);
+    if (status != XAIR_SYM_OK) return status;
+    return sat == XAIR_SYM_SAT ? XAIR_SYM_OK : XAIR_SYM_ERR_INFEASIBLE;
+}
+
+xair_sym_status xair_sym_solver_model_wide(xair_sym_state *state, xair_sym_expr_id symbol,
+    uint64_t *out_lo, uint64_t *out_hi) {
+    if (out_lo != NULL) *out_lo = 0;
+    if (out_hi != NULL) *out_hi = 0;
+    if (state == NULL || out_lo == NULL || out_hi == NULL || symbol >= state->context->expression_count)
+        return XAIR_SYM_ERR_BAD_ARG;
+    return xair_sym_solver_model_values(state, &symbol, 1, out_lo, out_hi);
+}
+
+xair_sym_status xair_sym_model_wide(xair_sym_state *state, xair_sym_expr_id symbol,
+    uint64_t *out_lo, uint64_t *out_hi) {
+    return xair_sym_solver_model_wide(state, symbol, out_lo, out_hi);
 }
 
 xair_sym_status xair_sym_check(xair_sym_state *state, xair_sym_expr_id extra, xair_sym_sat *out_sat) {
@@ -406,6 +918,7 @@ xair_sym_status xair_sym_check_ex(
     if (status != XAIR_SYM_OK) {
         xair_status reason = status == XAIR_SYM_ERR_CANCELED ? XAIR_ERR_CANCELED :
             status == XAIR_SYM_ERR_SOLVER_TIMEOUT ? XAIR_ERR_SOLVER_TIMEOUT :
+            status == XAIR_SYM_ERR_RESOURCE_LIMIT ? XAIR_ERR_RESOURCE_LIMIT :
             status == XAIR_SYM_ERR_SOLVER_UNKNOWN ? XAIR_ERR_SOLVER_UNKNOWN : XAIR_ERR_INCOMPLETE;
         xair_diagnostic_set(diagnostic, reason, XAIR_STAGE_SOLVER, 0, 0,
             state == NULL ? XAIR_INVALID_ID : state->block, XAIR_INVALID_ID,
@@ -419,7 +932,9 @@ xair_sym_status xair_sym_model_u64(xair_sym_state *state, xair_sym_expr_id symbo
     xair_sym_status status;
     uint64_t identity;
     size_t i;
+    if (out_value != NULL) *out_value = 0;
     if (state == NULL || out_value == NULL || symbol >= state->context->expression_count) return XAIR_SYM_ERR_BAD_ARG;
+    if (state->context->expressions[symbol]->bits > 64) return XAIR_SYM_ERR_UNSUPPORTED;
     identity = state->constraints == NULL ? 0 : state->constraints->identity;
     for (i = 0; i < state->context->model_cache_count; ++i) {
         xair_sym_model_cache_entry *entry = &state->context->model_cache[i];
@@ -434,9 +949,36 @@ xair_sym_status xair_sym_model_u64(xair_sym_state *state, xair_sym_expr_id symbo
     if (sat != XAIR_SYM_SAT) return XAIR_SYM_ERR_INFEASIBLE;
     if (state->context->model_cache_count == state->context->model_cache_capacity) {
         size_t capacity = state->context->model_cache_capacity == 0 ? 16 : state->context->model_cache_capacity * 2;
-        xair_sym_model_cache_entry *entries = (xair_sym_model_cache_entry *)realloc(
-            state->context->model_cache, capacity * sizeof(*entries));
-        if (entries == NULL) return XAIR_SYM_ERR_OOM;
+        size_t allocation;
+        size_t previous;
+        size_t maximum = context_memory_maximum(state->context);
+        size_t owned = context_owned_bytes(state->context,
+            state->context->solver_runtime == NULL ? 0 :
+                ((z3_runtime *)state->context->solver_runtime)->capacity);
+        xair_sym_model_cache_entry *entries;
+        if (capacity < state->context->model_cache_capacity ||
+            capacity > SIZE_MAX / sizeof(*entries)) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        allocation = capacity * sizeof(*entries);
+        previous = state->context->model_cache_capacity * sizeof(*entries);
+        if (state->context->solver_runtime != NULL) {
+            uint64_t z3_owned = ((z3_runtime *)state->context->solver_runtime)->estimated_bytes;
+            if (z3_owned > SIZE_MAX - owned) return XAIR_SYM_ERR_RESOURCE_LIMIT;
+            owned += (size_t)z3_owned;
+        }
+        if (maximum != 0 && (owned >= maximum || allocation > maximum - owned))
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        if (!xair_sym_parallel_memory_reserve(state->context, allocation))
+            return XAIR_SYM_ERR_RESOURCE_LIMIT;
+        entries = (xair_sym_model_cache_entry *)calloc(capacity, sizeof(*entries));
+        if (entries == NULL) {
+            xair_sym_parallel_memory_release(state->context, allocation);
+            return XAIR_SYM_ERR_OOM;
+        }
+        if (state->context->model_cache_count != 0)
+            memcpy(entries, state->context->model_cache,
+                state->context->model_cache_count * sizeof(*entries));
+        free(state->context->model_cache);
+        xair_sym_parallel_memory_release(state->context, previous);
         state->context->model_cache = entries;
         state->context->model_cache_capacity = capacity;
     }

@@ -9,7 +9,7 @@ extern "C" {
 
 #define XAIR_SYM_INVALID_ID UINT32_MAX
 #define XAIR_SYM_VERSION_MAJOR 0u
-#define XAIR_SYM_VERSION_MINOR 5u
+#define XAIR_SYM_VERSION_MINOR 6u
 #define XAIR_SYM_VERSION_PATCH 0u
 
 typedef uint32_t xair_sym_expr_id;
@@ -78,7 +78,42 @@ typedef struct {
     size_t scheduler_pruned;
     size_t concretizations;
     size_t compiled_dispatches;
+    size_t memory_pages;
+    size_t memory_page_copies;
+    size_t solver_translation_hits;
+    size_t solver_unknown;
+    size_t solver_timeouts;
+    size_t solver_canceled;
+    uint64_t solver_query_ms_total;
+    uint64_t solver_query_ms_max;
+    size_t model_calls;
+    size_t unknown_calls;
+    size_t states_queued;
+    size_t terminal_duplicates;
+    size_t coverage_blocks;
 } xair_sym_stats;
+
+enum {
+    XAIR_SYM_CAP_VERIFY = 1u << 0,
+    XAIR_SYM_CAP_FORMAT = 1u << 1,
+    XAIR_SYM_CAP_CONCRETE = 1u << 2,
+    XAIR_SYM_CAP_EXPRESSION = 1u << 3,
+    XAIR_SYM_CAP_Z3 = 1u << 4,
+    XAIR_SYM_CAP_FOLD = 1u << 5,
+    XAIR_SYM_CAP_TAINT = 1u << 6,
+    XAIR_SYM_CAP_SERIALIZE = 1u << 7,
+    XAIR_SYM_CAP_EXPLICIT_INCOMPLETE = 1u << 8
+};
+
+typedef struct {
+    xair_opcode opcode;
+    uint32_t capabilities;
+} xair_sym_opcode_capability;
+
+size_t xair_sym_opcode_capability_count(void);
+xair_sym_status xair_sym_opcode_capability_get(
+    size_t index, xair_sym_opcode_capability *out_capability);
+xair_sym_status xair_sym_opcode_capabilities_validate(void);
 
 typedef enum {
     XAIR_SYM_TAINT_EXPLICIT = 0,
@@ -89,7 +124,9 @@ typedef enum {
 typedef enum {
     XAIR_SYM_TAINT_NODE_SOURCE = 1,
     XAIR_SYM_TAINT_NODE_UNION,
-    XAIR_SYM_TAINT_NODE_SANITIZER
+    XAIR_SYM_TAINT_NODE_SANITIZER,
+    XAIR_SYM_TAINT_NODE_TRANSFORM,
+    XAIR_SYM_TAINT_NODE_SINK
 } xair_sym_taint_node_kind;
 
 typedef struct {
@@ -98,6 +135,31 @@ typedef struct {
     xair_sym_taint_id rhs;
     const char *name;
 } xair_sym_taint_view;
+
+typedef enum {
+    XAIR_SYM_TAINT_CATEGORY_UNKNOWN = 0,
+    XAIR_SYM_TAINT_CATEGORY_NETWORK,
+    XAIR_SYM_TAINT_CATEGORY_FILE,
+    XAIR_SYM_TAINT_CATEGORY_USER,
+    XAIR_SYM_TAINT_CATEGORY_REGISTRY,
+    XAIR_SYM_TAINT_CATEGORY_PROCESS,
+    XAIR_SYM_TAINT_CATEGORY_DRIVER
+} xair_sym_taint_category;
+
+typedef struct {
+    xair_sym_taint_category category;
+    uint64_t source_address;
+    uint64_t call_site;
+    uint64_t sink_address;
+    uint64_t byte_offset;
+    uint64_t byte_length;
+    xair_sym_expr_id guard;
+    uint8_t confidence;
+    uint8_t implicit;
+    uint8_t sanitizer_validated;
+    const char *transform;
+    const char *sink;
+} xair_sym_taint_details;
 
 typedef enum {
     XAIR_SYM_SEARCH_BFS = 0,
@@ -122,6 +184,31 @@ typedef struct {
     xair_sym_execution_mode execution_mode;
     const xair_sym_cancel_token *cancel_token;
 } xair_sym_explore_options;
+
+typedef enum {
+    XAIR_SYM_COMPLETED = 0,
+    XAIR_SYM_LIMIT_REACHED,
+    XAIR_SYM_CANCELED,
+    XAIR_SYM_INCOMPLETE,
+    XAIR_SYM_FAILED
+} xair_sym_completion_reason;
+
+typedef struct {
+    xair_sym_completion_reason completion_reason;
+    size_t states_processed;
+    size_t states_queued;
+    size_t states_pruned;
+    size_t forks;
+    size_t solver_queries;
+    size_t coverage_blocks;
+    size_t unresolved_operations;
+    size_t limits_reached;
+    size_t terminal_states;
+    size_t duplicate_terminal_states;
+    size_t workers_started;
+    size_t partitions;
+    size_t peak_memory_bytes;
+} xair_sym_explore_result;
 
 typedef struct xair_sym_context xair_sym_context;
 typedef struct xair_sym_state xair_sym_state;
@@ -152,6 +239,10 @@ typedef struct {
     uint64_t stack_base;
     size_t stack_size;
     size_t max_segment_size;
+    xair_calling_convention abi;
+    uint64_t fs_base;
+    uint64_t gs_base;
+    uint8_t enable_minimal_process_environment;
 } xair_sym_process_options;
 
 typedef enum {
@@ -173,6 +264,48 @@ typedef struct {
     uint16_t version_minor;
 } xair_sym_model_info;
 
+typedef struct {
+    const char *module;
+    const char *name;
+    uint32_t ordinal;
+    uint64_t address;
+    const char *user_identity;
+} xair_sym_model_identity;
+
+typedef struct {
+    uint32_t struct_size;
+    xair_sym_context *context;
+    xair_calling_convention abi;
+    xair_op_id call_op;
+    uint64_t call_site;
+    uint64_t direct_target;
+    uint32_t effects;
+    xair_confidence confidence;
+    xair_confidence output_confidence;
+    const char *import_module;
+    const char *import_name;
+    uint32_t import_ordinal;
+    size_t argument_count;
+    size_t result_count;
+} xair_sym_model_call_view;
+
+xair_sym_status xair_sym_model_call_get(
+    xair_sym_state *state, xair_op_id call_op, xair_sym_model_call_view *out_call);
+xair_sym_status xair_sym_model_call_argument_get(
+    xair_sym_state *state, xair_op_id call_op, size_t index,
+    xair_sym_expr_id *out_expression, xair_sym_taint_id *out_taint);
+xair_sym_status xair_sym_model_call_result_set(
+    xair_sym_state *state, xair_op_id call_op, size_t index,
+    xair_sym_expr_id expression, xair_sym_taint_id taint);
+void xair_sym_model_call_mark_incomplete(xair_sym_state *state, int memory_havoc);
+void xair_sym_model_call_terminate(xair_sym_state *state);
+xair_sym_status xair_sym_model_call_confidence_set(
+    xair_sym_state *state, xair_op_id call_op, xair_confidence confidence);
+
+xair_sym_status xair_sym_environment_register_model(
+    xair_sym_environment *environment, const xair_sym_model_identity *identity,
+    const xair_sym_model_info *info, xair_sym_call_model_cb callback, void *user);
+
 xair_sym_status xair_sym_context_create(xair_sym_context **out_context);
 void xair_sym_context_destroy(xair_sym_context *context);
 void xair_sym_context_stats(const xair_sym_context *context, xair_sym_stats *out_stats);
@@ -188,9 +321,27 @@ xair_sym_status xair_sym_taint_union(
 xair_sym_status xair_sym_taint_sanitize(
     xair_sym_context *context, xair_sym_taint_id input, const char *sanitizer,
     xair_sym_taint_id *out_taint);
+xair_sym_status xair_sym_taint_sanitize_ex(
+    xair_sym_context *context, xair_sym_taint_id input, const char *sanitizer,
+    int validated, xair_sym_taint_id *out_taint);
+xair_sym_status xair_sym_taint_transform(
+    xair_sym_context *context, xair_sym_taint_id input, const char *transform,
+    xair_sym_expr_id guard, int implicit, xair_sym_taint_id *out_taint);
 xair_sym_status xair_sym_taint_get(
     const xair_sym_context *context, xair_sym_taint_id taint,
     xair_sym_taint_view *out_view);
+xair_sym_status xair_sym_taint_source_ex(
+    xair_sym_context *context, const char *name,
+    const xair_sym_taint_details *details, xair_sym_taint_id *out_taint);
+xair_sym_status xair_sym_taint_get_details(
+    const xair_sym_context *context, xair_sym_taint_id taint,
+    xair_sym_taint_details *out_details);
+xair_sym_status xair_sym_taint_sink(
+    xair_sym_context *context, xair_sym_taint_id input,
+    const char *sink, uint64_t address, xair_sym_taint_id *out_taint);
+size_t xair_sym_taint_sink_count(const xair_sym_context *context);
+xair_sym_status xair_sym_taint_sink_get(
+    const xair_sym_context *context, size_t index, xair_sym_taint_id *out_taint);
 
 xair_sym_status xair_sym_const(
     xair_sym_context *context, uint16_t bits, uint64_t value, xair_sym_expr_id *out_expr);
@@ -231,12 +382,17 @@ xair_sym_status xair_sym_state_get_taint(
 xair_sym_status xair_sym_object_add(
     xair_sym_state *state, uint64_t base, size_t size, uint32_t permissions,
     xair_sym_object_id *out_object);
+xair_sym_status xair_sym_object_remove(
+    xair_sym_state *state, xair_sym_object_id object);
 xair_sym_status xair_sym_memory_store8(
     xair_sym_state *state, uint64_t address, xair_sym_expr_id value);
 xair_sym_status xair_sym_memory_load8(
     const xair_sym_state *state, uint64_t address, xair_sym_expr_id *out_value);
 xair_sym_status xair_sym_memory_store_taint8(
     xair_sym_state *state, uint64_t address, xair_sym_taint_id taint);
+xair_sym_status xair_sym_memory_store_bytes(
+    xair_sym_state *state, uint64_t address, const xair_sym_expr_id *values,
+    const xair_sym_taint_id *taints, size_t count);
 xair_sym_status xair_sym_memory_load_taint8(
     const xair_sym_state *state, uint64_t address, xair_sym_taint_id *out_taint);
 
@@ -247,6 +403,9 @@ xair_sym_status xair_sym_check_ex(
     xair_diagnostic *diagnostic);
 xair_sym_status xair_sym_model_u64(
     xair_sym_state *state, xair_sym_expr_id symbol, uint64_t *out_value);
+xair_sym_status xair_sym_model_wide(
+    xair_sym_state *state, xair_sym_expr_id symbol,
+    uint64_t *out_lo, uint64_t *out_hi);
 xair_sym_status xair_sym_model_bytes(
     xair_sym_state *state, const xair_sym_expr_id *symbols, size_t count,
     uint8_t *out_bytes);
@@ -270,6 +429,9 @@ xair_sym_status xair_sym_snapshot_save(
 xair_sym_status xair_sym_snapshot_load(
     xair_sym_context *context, const xair_module *module, const char *path,
     xair_sym_snapshot **out_snapshot);
+xair_sym_status xair_sym_snapshot_load_bytes(
+    xair_sym_context *context, const xair_module *module,
+    const uint8_t *bytes, size_t size, xair_sym_snapshot **out_snapshot);
 
 typedef struct {
     size_t workers;
@@ -304,12 +466,18 @@ xair_sym_status xair_sym_process_create(
     const xair_binary_view *binary, const xair_sym_process_options *options,
     xair_sym_environment **out_environment, xair_sym_state **out_state);
 void xair_sym_environment_destroy(xair_sym_environment *environment);
+xair_sym_status xair_sym_state_attach_environment(
+    xair_sym_state *state, xair_sym_environment *environment);
 xair_sym_status xair_sym_environment_model(
     const xair_sym_environment *environment, const char *name,
     xair_sym_model_kind *out_kind);
 xair_sym_status xair_sym_environment_model_info(
     const xair_sym_environment *environment, const char *name,
     xair_sym_model_info *out_info);
+xair_sym_status xair_sym_environment_model_identity(
+    const xair_sym_environment *environment,
+    const xair_sym_model_identity *identity, xair_sym_model_info *out_info);
+uint64_t xair_sym_environment_model_version(const xair_sym_environment *environment);
 xair_sym_status xair_sym_environment_allocate(
     xair_sym_environment *environment, xair_sym_state *state,
     size_t size, uint64_t *out_address);
@@ -332,6 +500,45 @@ xair_sym_status xair_sym_explore_with_options_ex(
     xair_sym_state *initial, const xair_sym_explore_options *options,
     xair_sym_terminal_cb callback, void *user,
     xair_analysis_result *result, xair_diagnostic *diagnostic);
+xair_sym_status xair_sym_explore_detailed(
+    xair_sym_state *initial, const xair_sym_explore_options *options,
+    xair_sym_terminal_cb callback, void *user,
+    xair_sym_explore_result *result, xair_diagnostic *diagnostic);
+
+xair_sym_status xair_sym_parallel_explore_detailed(
+    const xair_sym_snapshot *snapshot, const xair_sym_parallel_options *options,
+    xair_sym_terminal_cb callback, void *user,
+    xair_sym_explore_result *result, xair_diagnostic *diagnostic);
+
+typedef struct {
+    uint32_t schema_version;
+    uint32_t symbolic_version;
+    uint32_t memory_model_version;
+    xair_calling_convention abi;
+    uint64_t ir_fingerprint;
+    uint64_t binary_hash;
+    uint64_t model_library_version;
+    uint64_t options_fingerprint;
+    xair_sym_completion_reason completeness;
+} xair_sym_snapshot_metadata;
+
+enum {
+    XAIR_SYM_SNAPSHOT_EXPECT_BINARY = 1u << 0,
+    XAIR_SYM_SNAPSHOT_EXPECT_ABI = 1u << 1,
+    XAIR_SYM_SNAPSHOT_EXPECT_MODELS = 1u << 2,
+    XAIR_SYM_SNAPSHOT_EXPECT_OPTIONS = 1u << 3
+};
+
+xair_sym_status xair_sym_snapshot_load_bytes_checked(
+    xair_sym_context *context, const xair_module *module,
+    const uint8_t *bytes, size_t size,
+    const xair_sym_snapshot_metadata *expected, uint32_t expectation_flags,
+    xair_sym_snapshot **out_snapshot);
+
+xair_sym_status xair_sym_snapshot_metadata_get(
+    const xair_sym_snapshot *snapshot, xair_sym_snapshot_metadata *out_metadata);
+xair_sym_status xair_sym_snapshot_fingerprint(
+    const xair_sym_snapshot *snapshot, uint64_t *out_fingerprint);
 
 xair_block_id xair_sym_state_block(const xair_sym_state *state);
 const char *xair_sym_status_name(xair_sym_status status);

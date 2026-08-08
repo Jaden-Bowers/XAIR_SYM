@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Kept local while xair_sym_internal.h is being changed by the Phase 6 owner. */
+xair_sym_status xair_sym_solver_model_values(xair_sym_state *state,
+    const xair_sym_expr_id *symbols, size_t count, uint64_t *out_lo, uint64_t *out_hi);
+
 xair_sym_status xair_sym_trace_create(xair_sym_trace **out_trace) {
     xair_sym_trace *trace;
     if (out_trace == NULL) return XAIR_SYM_ERR_BAD_ARG;
@@ -100,15 +104,35 @@ xair_sym_status xair_sym_model_bytes(
     const xair_sym_expr_id *symbols,
     size_t count,
     uint8_t *out_bytes) {
+    uint64_t *values;
+    uint64_t *high;
+    xair_sym_status status;
     size_t i;
     if (state == NULL || (count != 0 && (symbols == NULL || out_bytes == NULL))) return XAIR_SYM_ERR_BAD_ARG;
+    if (count == 0) return XAIR_SYM_OK;
+    memset(out_bytes, 0, count);
+    if (count > SIZE_MAX / (2u * sizeof(*values))) return XAIR_SYM_ERR_RANGE;
+    if (state->context->analysis.max_memory != 0 &&
+        count > state->context->analysis.max_memory / (2u * sizeof(*values)))
+        return XAIR_SYM_ERR_RESOURCE_LIMIT;
     for (i = 0; i < count; ++i) {
-        uint64_t value;
-        xair_sym_status status = xair_sym_model_u64(state, symbols[i], &value);
-        if (status != XAIR_SYM_OK) return status;
-        out_bytes[i] = (uint8_t)value;
+        if (symbols[i] >= state->context->expression_count ||
+            state->context->expressions[symbols[i]]->bits > 8u)
+            return XAIR_SYM_ERR_BAD_ARG;
     }
-    return XAIR_SYM_OK;
+    values = (uint64_t *)calloc(count, sizeof(*values));
+    high = (uint64_t *)calloc(count, sizeof(*high));
+    if (values == NULL || high == NULL) {
+        free(high);
+        free(values);
+        return XAIR_SYM_ERR_OOM;
+    }
+    status = xair_sym_solver_model_values(state, symbols, count, values, high);
+    if (status == XAIR_SYM_OK)
+        for (i = 0; i < count; ++i) out_bytes[i] = (uint8_t)values[i];
+    free(high);
+    free(values);
+    return status;
 }
 
 xair_sym_status xair_sym_state_concretize(

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(xair_sym VERSION 0.5.0 LANGUAGES C CXX)
+project(xair_sym VERSION 0.6.0 LANGUAGES C CXX)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../xair/cmake/XAIRCommon.cmake")
     include("${CMAKE_CURRENT_SOURCE_DIR}/../xair/cmake/XAIRCommon.cmake")
@@ -42,6 +42,7 @@ else()
 endif()
 
 add_library(xair_sym STATIC
+    src/xair_sym_capabilities.c
     src/xair_sym_core.c
     src/xair_sym_memory.c
     src/xair_sym_taint.c
@@ -68,6 +69,39 @@ target_link_libraries(xair_sym_tests PRIVATE xair_sym)
 xair_apply_warnings(xair_sym_tests)
 xair_keep_asserts(xair_sym_tests)
 add_test(NAME xair_sym_tests COMMAND xair_sym_tests)
+add_executable(xair_sym_solver_model_tests tests/test_solver_model.c)
+target_link_libraries(xair_sym_solver_model_tests PRIVATE xair_sym)
+xair_apply_warnings(xair_sym_solver_model_tests)
+xair_keep_asserts(xair_sym_solver_model_tests)
+add_test(NAME xair_sym_solver_model_tests COMMAND xair_sym_solver_model_tests)
+add_executable(xair_sym_snapshot_fresh_tests tests/test_snapshot_fresh.c)
+target_link_libraries(xair_sym_snapshot_fresh_tests PRIVATE xair_sym)
+xair_apply_warnings(xair_sym_snapshot_fresh_tests)
+xair_keep_asserts(xair_sym_snapshot_fresh_tests)
+add_test(NAME xair_sym_snapshot_fresh_tests COMMAND xair_sym_snapshot_fresh_tests)
+add_executable(xair_sym_benchmark tests/benchmark_sym.c)
+target_link_libraries(xair_sym_benchmark PRIVATE xair_sym)
+xair_apply_warnings(xair_sym_benchmark)
+add_test(NAME xair_sym_benchmark_smoke COMMAND xair_sym_benchmark)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME xair_sym_opcode_capabilities
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_opcode_capabilities.py)
+
+endif()
+
+if(XAIR_BUILD_FUZZERS)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "XAIR_BUILD_FUZZERS requires Clang/libFuzzer")
+    endif()
+    foreach(sym_fuzzer IN ITEMS sym_fuzzer snapshot_loader expression_builder)
+        add_executable(xair_fuzz_${sym_fuzzer} tests/fuzz_${sym_fuzzer}.c)
+        target_link_libraries(xair_fuzz_${sym_fuzzer} PRIVATE xair_sym)
+        xair_apply_warnings(xair_fuzz_${sym_fuzzer})
+        target_compile_options(xair_fuzz_${sym_fuzzer} PRIVATE
+            -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+        target_link_options(xair_fuzz_${sym_fuzzer} PRIVATE
+            -fsanitize=fuzzer,address,undefined)
+    endforeach()
 endif()
 
 install(TARGETS xair_sym EXPORT XAIRSymTargets
@@ -89,3 +123,15 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/XAIRSymConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/XAIRSymConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XAIRSym)
+install(FILES LICENSE REUSE.toml DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/xair_sym)
+install(DIRECTORY LICENSES/ DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/xair_sym/LICENSES)
+if(XAIR_Z3_SOURCE_ROOT AND EXISTS "${XAIR_Z3_SOURCE_ROOT}/LICENSE.txt")
+    set(XAIR_Z3_LICENSE_FILE "${XAIR_Z3_SOURCE_ROOT}/LICENSE.txt")
+elseif(DEFINED z3_SOURCE_DIR AND EXISTS "${z3_SOURCE_DIR}/LICENSE.txt")
+    set(XAIR_Z3_LICENSE_FILE "${z3_SOURCE_DIR}/LICENSE.txt")
+endif()
+if(XAIR_Z3_LICENSE_FILE)
+    install(FILES "${XAIR_Z3_LICENSE_FILE}"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/xair_sym/third-party
+        RENAME Z3-LICENSE.txt)
+endif()
