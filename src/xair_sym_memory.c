@@ -110,6 +110,10 @@ xair_sym_status xair_sym_memory_make_unique(xair_sym_state *state) {
             target->pages = (xair_sym_page **)calloc(source->page_count != 0 ? source->page_count : 1,
                 sizeof(*target->pages));
             if (target->pages == NULL) {
+                /* The shallow copy still names the source page count.  Clear it
+                 * before releasing this partial object so cleanup never walks
+                 * the failed (NULL) page-vector allocation. */
+                target->page_count = 0;
                 copy->count = i + 1; xair_sym_memory_release(copy);
                 xair_sym_parallel_memory_release(state->context, needed); return XAIR_SYM_ERR_OOM;
             }
