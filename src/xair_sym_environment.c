@@ -781,11 +781,12 @@ xair_sym_status xair_sym_state_attach_environment(xair_sym_state *state,
     return XAIR_SYM_OK;
 }
 
-xair_sym_status xair_sym_environment_register_model(xair_sym_environment *environment,
+static xair_sym_status environment_register_model_impl(xair_sym_environment *environment,
     const xair_sym_model_identity *identity, const xair_sym_model_info *info,
-    xair_sym_call_model_cb callback, void *user) {
+    xair_sym_call_model_cb callback, void *user, int callback_required) {
     xair_sym_registered_model *entry;
-    if (environment == NULL || identity == NULL || info == NULL || callback == NULL ||
+    if (environment == NULL || identity == NULL || info == NULL ||
+        (callback_required && callback == NULL) ||
         (identity->module == NULL && identity->name == NULL && identity->ordinal == 0 &&
          identity->address == 0 && identity->user_identity == NULL)) return XAIR_SYM_ERR_BAD_ARG;
     if (environment->model_count == environment->model_capacity) {
@@ -821,6 +822,20 @@ xair_sym_status xair_sym_environment_register_model(xair_sym_environment *enviro
     environment->model_version = (environment->model_version ^ info->version_major) * UINT64_C(1099511628211);
     environment->model_version = (environment->model_version ^ info->version_minor) * UINT64_C(1099511628211);
     return XAIR_SYM_OK;
+}
+
+xair_sym_status xair_sym_environment_register_model(xair_sym_environment *environment,
+    const xair_sym_model_identity *identity, const xair_sym_model_info *info,
+    xair_sym_call_model_cb callback, void *user) {
+    return environment_register_model_impl(
+        environment, identity, info, callback, user, 1);
+}
+
+xair_sym_status xair_sym_environment_register_model_kind(
+    xair_sym_environment *environment, const xair_sym_model_identity *identity,
+    const xair_sym_model_info *info) {
+    return environment_register_model_impl(
+        environment, identity, info, NULL, NULL, 0);
 }
 
 xair_sym_status xair_sym_environment_model(

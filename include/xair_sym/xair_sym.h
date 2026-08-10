@@ -305,9 +305,17 @@ xair_sym_status xair_sym_model_call_confidence_set(
 xair_sym_status xair_sym_environment_register_model(
     xair_sym_environment *environment, const xair_sym_model_identity *identity,
     const xair_sym_model_info *info, xair_sym_call_model_cb callback, void *user);
+/* Registers identity/version/kind metadata while retaining xair_sym's built-in
+ * execution for that kind. This is intended for versioned model libraries
+ * whose unsupported kinds must keep the ordinary unknown-call fallback. */
+xair_sym_status xair_sym_environment_register_model_kind(
+    xair_sym_environment *environment, const xair_sym_model_identity *identity,
+    const xair_sym_model_info *info);
 
 xair_sym_status xair_sym_context_create(xair_sym_context **out_context);
 void xair_sym_context_destroy(xair_sym_context *context);
+/* True only after a solver-backed query has instantiated the lazy Z3 runtime. */
+int xair_sym_context_solver_initialized(const xair_sym_context *context);
 void xair_sym_context_stats(const xair_sym_context *context, xair_sym_stats *out_stats);
 void xair_sym_context_set_analysis_options(
     xair_sym_context *context, const xair_analysis_options *options);

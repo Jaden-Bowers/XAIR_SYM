@@ -270,6 +270,10 @@ void xair_sym_context_destroy(xair_sym_context *context) {
     }
 }
 
+int xair_sym_context_solver_initialized(const xair_sym_context *context) {
+    return context != NULL && context->solver_runtime != NULL;
+}
+
 void xair_sym_context_stats(const xair_sym_context *context, xair_sym_stats *out_stats) {
     if (context != NULL && out_stats != NULL) {
         *out_stats = context->stats;

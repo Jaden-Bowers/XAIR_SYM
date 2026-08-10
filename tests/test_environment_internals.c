@@ -33,6 +33,7 @@ xair_sym_status test_environment_copy(xair_sym_environment *environment,
 #define xair_sym_environment_destroy test_environment_destroy
 #define xair_sym_state_attach_environment test_state_attach_environment
 #define xair_sym_environment_register_model test_environment_register_model
+#define xair_sym_environment_register_model_kind test_environment_register_model_kind
 #define xair_sym_environment_model test_environment_model
 #define xair_sym_environment_model_info test_environment_model_info
 #define xair_sym_environment_model_identity test_environment_model_identity
@@ -57,6 +58,7 @@ xair_sym_status test_environment_copy(xair_sym_environment *environment,
 #undef xair_sym_environment_destroy
 #undef xair_sym_state_attach_environment
 #undef xair_sym_environment_register_model
+#undef xair_sym_environment_register_model_kind
 #undef xair_sym_environment_model
 #undef xair_sym_environment_model_info
 #undef xair_sym_environment_model_identity

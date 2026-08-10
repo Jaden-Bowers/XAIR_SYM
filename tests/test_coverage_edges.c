@@ -336,6 +336,23 @@ static void test_environment_parallel_and_cancel(xair_module *module,
         noop_model, NULL) == XAIR_SYM_ERR_BAD_ARG);
     assert(xair_sym_environment_register_model(environment, &identity, &info,
         NULL, NULL) == XAIR_SYM_ERR_BAD_ARG);
+    assert(xair_sym_environment_register_model_kind(NULL, &identity, &info) ==
+        XAIR_SYM_ERR_BAD_ARG);
+    assert(xair_sym_environment_register_model_kind(environment, NULL, &info) ==
+        XAIR_SYM_ERR_BAD_ARG);
+    {
+        xair_sym_model_identity kind_identity = {0};
+        kind_identity.module = "phase7";
+        kind_identity.name = "kind_only";
+        info.kind = XAIR_SYM_MODEL_INPUT;
+        info.version_major = 7;
+        info.version_minor = 0;
+        require_sym(xair_sym_environment_register_model_kind(
+            environment, &kind_identity, &info));
+        require_sym(xair_sym_environment_model_identity(
+            environment, &kind_identity, &info));
+        assert(info.kind == XAIR_SYM_MODEL_INPUT && info.version_major == 7);
+    }
     for (i = 0; i < 9; ++i) {
         char name[32];
         xair_sym_model_identity registered = {0};
