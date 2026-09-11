@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(xair_sym VERSION 0.6.0 LANGUAGES C CXX)
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../xair/cmake/XAIRCommon.cmake")
+if(TARGET xair)
+    get_target_property(_indago_xair_source xair SOURCE_DIR)
+    include("${_indago_xair_source}/cmake/XAIRCommon.cmake")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../xair/cmake/XAIRCommon.cmake")
     include("${CMAKE_CURRENT_SOURCE_DIR}/../xair/cmake/XAIRCommon.cmake")
 else()
     message(FATAL_ERROR "xair_sym requires sibling xair and xair_cfg checkouts")
@@ -27,8 +30,7 @@ if(NOT TARGET libz3 AND NOT TARGET z3::libz3)
         include(FetchContent)
         FetchContent_Declare(z3
             GIT_REPOSITORY https://github.com/Z3Prover/z3.git
-            GIT_TAG z3-5.0.0
-            GIT_SHALLOW TRUE)
+            GIT_TAG 8e3402b215a810a4154eb183a7dfc4e853eb2f52)
         FetchContent_MakeAvailable(z3)
     endif()
 endif()
