@@ -255,7 +255,8 @@ typedef enum {
     XAIR_SYM_MODEL_LENGTH,
     XAIR_SYM_MODEL_NO_RETURN,
     XAIR_SYM_MODEL_DRIVER_INPUT,
-    XAIR_SYM_MODEL_DRIVER_COMPLETE
+    XAIR_SYM_MODEL_DRIVER_COMPLETE,
+    XAIR_SYM_MODEL_COMPARE
 } xair_sym_model_kind;
 
 typedef struct {
@@ -474,6 +475,10 @@ xair_sym_status xair_sym_process_create(
     const xair_binary_view *binary, const xair_sym_process_options *options,
     xair_sym_environment **out_environment, xair_sym_state **out_state);
 void xair_sym_environment_destroy(xair_sym_environment *environment);
+/* Create only the versioned builtin call-model environment. Memory and register
+ * seeds remain the caller's responsibility; this does not create a process. */
+xair_sym_status xair_sym_environment_create_builtin(xair_sym_context *context,
+    xair_arch arch, xair_calling_convention abi, xair_sym_environment **out_environment);
 xair_sym_status xair_sym_state_attach_environment(
     xair_sym_state *state, xair_sym_environment *environment);
 xair_sym_status xair_sym_environment_model(

@@ -214,7 +214,7 @@ static void test_snapshot_edges(xair_module *module, xair_block_id block,
     require_sym(xair_sym_memory_store8(state, 0x500f, symbol));
     require_sym(xair_sym_memory_store_taint8(state, 0x500f, transformed_taint));
     require_sym(xair_sym_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64,
-        XAIR_CC_SYSV_X64, UINT64_C(0x00010000), UINT64_C(0x70000000),
+        XAIR_CC_SYSV_X64, UINT64_C(0x00010001), UINT64_C(0x70000000),
         0x1000, UINT64_C(0x40000000), &environment));
     xair_sym_environment_attach_builtin(state, environment); environment = NULL;
     require_sym(xair_sym_snapshot_take(state, &snapshot));
@@ -318,7 +318,7 @@ static void test_environment_parallel_and_cancel(xair_module *module,
     require_sym(xair_sym_symbol(context, 8, "parallel_edge", &symbol));
     require_sym(xair_sym_state_set_value(state, value, symbol));
     require_sym(xair_sym_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64,
-        XAIR_CC_SYSV_X64, UINT64_C(0x00010000), UINT64_C(0x70000000),
+        XAIR_CC_SYSV_X64, UINT64_C(0x00010001), UINT64_C(0x70000000),
         0x1000, UINT64_C(0x40000000), &environment));
     require_sym(xair_sym_environment_clone_builtin(environment, context, &copy));
     xair_sym_environment_attach_builtin(state, copy); copy = NULL;
@@ -559,7 +559,7 @@ static void test_unknown_environment_call(void) {
     require_sym(xair_sym_state_set_value(state, argument, argument_expr));
     require_sym(xair_sym_state_set_taint(state, argument, argument_taint));
     require_sym(xair_sym_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64,
-        XAIR_CC_SYSV_X64, UINT64_C(0x00010000), UINT64_C(0x70000000),
+        XAIR_CC_SYSV_X64, UINT64_C(0x00010001), UINT64_C(0x70000000),
         0x1000, UINT64_C(0x40000000), &environment));
     require_sym(xair_sym_state_attach_environment(state, environment));
     xair_sym_environment_destroy(environment);
@@ -624,7 +624,7 @@ static void test_builtin_environment_calls(void) {
     require_sym(xair_sym_context_create(&context));
     require_sym(xair_sym_state_create(context, module, block, &state));
     require_sym(xair_sym_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64,
-        XAIR_CC_SYSV_X64, UINT64_C(0x00010000), UINT64_C(0x70000000),
+        XAIR_CC_SYSV_X64, UINT64_C(0x00010001), UINT64_C(0x70000000),
         0x1000, UINT64_C(0x40000000), &environment));
     require_sym(xair_sym_environment_allocate(environment, state, 16, &destination));
     require_sym(xair_sym_environment_allocate(environment, state, 16, &source));
@@ -648,6 +648,52 @@ static void test_builtin_environment_calls(void) {
     xair_module_destroy(module);
 }
 
+typedef struct {xair_sym_context *context;xair_value_id result;xair_sym_expr_id input;size_t seen;} compare_fixture;
+static xair_sym_status compare_terminal(xair_sym_state *state,void *opaque) {
+    compare_fixture *f=(compare_fixture *)opaque;
+    xair_sym_expr_id value,zero,b,eq,ne,both; xair_sym_sat sat;
+    require_sym(xair_sym_state_get_value(state,f->result,&value));
+    require_sym(xair_sym_const(f->context,32,0,&zero));require_sym(xair_sym_const(f->context,8,'B',&b));
+    require_sym(xair_sym_binary(f->context,XAIR_OP_EQ,1,value,zero,&eq));
+    require_sym(xair_sym_binary(f->context,XAIR_OP_NE,1,f->input,b,&ne));
+    require_sym(xair_sym_binary(f->context,XAIR_OP_AND,1,eq,ne,&both));
+    require_sym(xair_sym_check(state,both,&sat));assert(sat==XAIR_SYM_UNSAT);
+    require_sym(xair_sym_check(state,eq,&sat));assert(sat==XAIR_SYM_SAT);
+    require_sym(xair_sym_const(f->context,8,'A',&b));
+    require_sym(xair_sym_binary(f->context,XAIR_OP_EQ,1,f->input,b,&ne));
+    require_sym(xair_sym_const(f->context,32,UINT32_C(0xfffffff9),&zero));
+    require_sym(xair_sym_binary(f->context,XAIR_OP_EQ,1,value,zero,&eq));
+    require_sym(xair_sym_binary(f->context,XAIR_OP_AND,1,eq,ne,&both));
+    require_sym(xair_sym_check(state,both,&sat));assert(sat==XAIR_SYM_SAT);
+    require_sym(xair_sym_const(f->context,32,7,&zero));
+    require_sym(xair_sym_binary(f->context,XAIR_OP_EQ,1,value,zero,&eq));
+    require_sym(xair_sym_binary(f->context,XAIR_OP_AND,1,eq,ne,&both));
+    require_sym(xair_sym_check(state,both,&sat));assert(sat==XAIR_SYM_UNSAT);
+    ++f->seen;return XAIR_SYM_OK;
+}
+static void test_bounded_memcmp(void) {
+    xair_module *module=NULL;xair_block_id block;xair_value_id args[3],result;
+    xair_sym_context *context=NULL;xair_sym_state *state=NULL;xair_sym_environment *environment=NULL;
+    xair_sym_expr_id value,input;xair_sym_object_id object;xair_op_attributes attr;
+    xair_type type=xair_type_i(32);const char *name="comparison";size_t i;compare_fixture fixture;
+    require_xair(xair_module_create(&module));require_xair(xair_block_create(module,"compare",&block));
+    for(i=0;i<3;++i)require_xair(xair_block_add_param(module,block,xair_type_i(64),"arg",&args[i]));
+    memset(&attr,0,sizeof(attr));attr.kind=XAIR_ATTR_CALL;attr.call_kind=XAIR_CALL_DIRECT_EXTERNAL;
+    attr.calling_convention=XAIR_CC_SYSV_X64;attr.effects=XAIR_EFFECT_READ_MEMORY;attr.import_name="memcmp";
+    require_xair(xair_build_call(module,block,args,3,&type,&name,1,&attr,&result));
+    require_xair(xair_set_return(module,block,&result,1));require_xair(xair_module_freeze(module));
+    require_sym(xair_sym_context_create(&context));require_sym(xair_sym_state_create(context,module,block,&state));
+    require_sym(xair_sym_environment_create_builtin_snapshot(context,XAIR_ARCH_X86_64,XAIR_CC_SYSV_X64,0x10001,0x70000000,0x1000,0x40000000,&environment));
+    require_sym(xair_sym_state_attach_environment(state,environment));xair_sym_environment_destroy(environment);
+    require_sym(xair_sym_object_add(state,0x2000,2,3,&object));
+    require_sym(xair_sym_symbol(context,8,"input_byte",&input));require_sym(xair_sym_memory_store8(state,0x2000,input));
+    require_sym(xair_sym_const(context,8,'B',&value));require_sym(xair_sym_memory_store8(state,0x2001,value));
+    for(i=0;i<3;++i){require_sym(xair_sym_const(context,64,i==0?0x2000:i==1?0x2001:1,&value));require_sym(xair_sym_state_set_value(state,args[i],value));}
+    fixture.context=context;fixture.result=result;fixture.input=input;fixture.seen=0;
+    require_sym(xair_sym_explore(state,4,8,compare_terminal,&fixture));assert(fixture.seen==1);
+    xair_sym_state_destroy(state);xair_sym_context_destroy(context);xair_module_destroy(module);
+}
+
 int main(void) {
     xair_module *module = NULL;
     xair_block_id block;
@@ -661,6 +707,7 @@ int main(void) {
     test_operator_and_folding_matrix(module, block);
     test_unknown_environment_call();
     test_builtin_environment_calls();
+    test_bounded_memcmp();
     xair_module_destroy(module);
     return 0;
 }

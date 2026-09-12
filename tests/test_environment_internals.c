@@ -25,6 +25,7 @@ xair_sym_status test_environment_copy(xair_sym_environment *environment,
 #define xair_sym_model_call_confidence_set test_model_call_confidence_set
 #define xair_sym_environment_clone_builtin test_environment_clone_builtin
 #define xair_sym_environment_create_builtin_snapshot test_environment_create_builtin_snapshot
+#define xair_sym_environment_create_builtin test_environment_create_builtin
 #define xair_sym_environment_attach_builtin test_environment_attach_builtin
 #define xair_sym_process_options_init test_process_options_init
 #define xair_sym_process_create test_process_create
@@ -43,6 +44,7 @@ xair_sym_status test_environment_copy(xair_sym_environment *environment,
 #define xair_sym_environment_copy test_environment_copy
 #include "../src/xair_sym_environment.c"
 #undef xair_sym_model_call_get
+#undef xair_sym_environment_create_builtin
 #undef xair_sym_model_call_argument_get
 #undef xair_sym_model_call_result_set
 #undef xair_sym_model_call_mark_incomplete
@@ -148,7 +150,7 @@ static void test_builtin_environment_edges(void) {
     source.context = context;
     source.arch = XAIR_ARCH_X86_64;
     source.abi = XAIR_CC_WIN64;
-    source.model_version = UINT64_C(0x00010000);
+    source.model_version = UINT64_C(0x00010001);
     source.stack_base = 0x70000000u;
     source.stack_size = 4096u;
     source.heap_next = 0x90000000u;
@@ -166,21 +168,21 @@ static void test_builtin_environment_edges(void) {
     copy = NULL;
 
     assert(test_environment_create_builtin_snapshot(NULL, XAIR_ARCH_X86_64, XAIR_CC_WIN64,
-        UINT64_C(0x00010000), 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
+        UINT64_C(0x00010001), 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
     assert(test_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64, XAIR_CC_WIN64,
-        UINT64_C(0x00010000), 0x70000000u, 4096u, 0x90000000u, NULL) == XAIR_SYM_ERR_BAD_ARG);
+        UINT64_C(0x00010001), 0x70000000u, 4096u, 0x90000000u, NULL) == XAIR_SYM_ERR_BAD_ARG);
     assert(test_environment_create_builtin_snapshot(context, (xair_arch)99, XAIR_CC_WIN64,
-        UINT64_C(0x00010000), 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
+        UINT64_C(0x00010001), 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
     assert(test_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64, (xair_calling_convention)99,
-        UINT64_C(0x00010000), 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
+        UINT64_C(0x00010001), 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
     assert(test_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64, XAIR_CC_WIN64,
         7u, 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
     assert(test_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64, XAIR_CC_WIN64,
-        UINT64_C(0x00010000), 0x70000000u, 0u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
+        UINT64_C(0x00010001), 0x70000000u, 0u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
     assert(test_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64, XAIR_CC_WIN64,
-        UINT64_C(0x00010000), UINT64_MAX - 3u, 8u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
+        UINT64_C(0x00010001), UINT64_MAX - 3u, 8u, 0x90000000u, &environment) == XAIR_SYM_ERR_BAD_ARG);
     assert(test_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64, XAIR_CC_WIN64,
-        UINT64_C(0x00010000), 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_OK);
+        UINT64_C(0x00010001), 0x70000000u, 4096u, 0x90000000u, &environment) == XAIR_SYM_OK);
     assert(environment != NULL && environment->stack_size == 4096u);
 
     memset(&info, 0, sizeof(info));

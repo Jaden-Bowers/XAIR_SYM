@@ -17,7 +17,8 @@ static const builtin_model builtin_models[] = {
     {"ExitProcess", XAIR_SYM_MODEL_NO_RETURN}, {"ExAllocatePool", XAIR_SYM_MODEL_ALLOC},
     {"ExAllocatePoolWithTag", XAIR_SYM_MODEL_ALLOC}, {"ExFreePool", XAIR_SYM_MODEL_FREE},
     {"ProbeForRead", XAIR_SYM_MODEL_DRIVER_INPUT}, {"ProbeForWrite", XAIR_SYM_MODEL_DRIVER_INPUT},
-    {"IoCompleteRequest", XAIR_SYM_MODEL_DRIVER_COMPLETE}
+    {"IoCompleteRequest", XAIR_SYM_MODEL_DRIVER_COMPLETE},
+    {"memcmp", XAIR_SYM_MODEL_COMPARE}
 };
 
 static xair_sym_model_kind lookup_model(const char *name) {
@@ -260,6 +261,45 @@ static xair_sym_status unknown_call_fallback(xair_sym_state *state, xair_op_id o
     return XAIR_SYM_OK;
 }
 
+/* ISO memcmp constrains the sign, not the nonzero magnitude. Keep the latter
+ * symbolic so implementation-specific return-value tests are not falsely proved.
+ * Only concrete bounded pointers/lengths and fully available memory are modeled. */
+static xair_sym_status compare_call(xair_sym_state *state,xair_op_id op,const uint64_t *args,size_t count) {
+    const xair_value_id *outputs;size_t output_count,i,result_index=SIZE_MAX;
+    xair_sym_expr_id equal,less,zero,value,eq_result,negative,rule,combined;
+    xair_sym_taint_id taint=XAIR_SYM_TAINT_NONE;
+    xair_sym_status status;uint16_t bits=0;char name[96];
+#define CMP_NEED(expression) do {status=(expression);if(status!=XAIR_SYM_OK)return status;}while(0)
+    if(count!=3||args[2]>256||args[0]>UINT64_MAX-args[2]||args[1]>UINT64_MAX-args[2])return XAIR_SYM_ERR_UNSUPPORTED;
+    if(xair_op_results(state->module,op,&outputs,&output_count)!=XAIR_OK)return XAIR_SYM_ERR_BAD_ARG;
+    for(i=0;i<output_count;++i){xair_type type=xair_value_type(state->module,outputs[i]);
+        if(type.kind==XAIR_TYPE_INT){if(result_index!=SIZE_MAX)return XAIR_SYM_ERR_UNSUPPORTED;result_index=i;bits=type.bits;}}
+    if(result_index==SIZE_MAX||bits!=32)return XAIR_SYM_ERR_UNSUPPORTED;
+    CMP_NEED(xair_sym_const(state->context,1,1,&equal));
+    CMP_NEED(xair_sym_const(state->context,1,0,&less));
+    for(i=(size_t)args[2];i>0;--i){xair_sym_expr_id a,b,eq,lt,next; xair_sym_taint_id at,bt;
+        CMP_NEED(loop_guard(state->context,(size_t)args[2]-i));
+        CMP_NEED(xair_sym_memory_load8(state,args[0]+i-1,&a));CMP_NEED(xair_sym_memory_load8(state,args[1]+i-1,&b));
+        CMP_NEED(xair_sym_memory_load_taint8(state,args[0]+i-1,&at));CMP_NEED(xair_sym_memory_load_taint8(state,args[1]+i-1,&bt));
+        CMP_NEED(xair_sym_taint_union(state->context,taint,at,&taint));CMP_NEED(xair_sym_taint_union(state->context,taint,bt,&taint));
+        CMP_NEED(xair_sym_binary(state->context,XAIR_OP_EQ,1,a,b,&eq));
+        CMP_NEED(xair_sym_binary(state->context,XAIR_OP_ULT,1,a,b,&lt));
+        CMP_NEED(xair_sym_select(state->context,eq,less,lt,&next));less=next;
+        CMP_NEED(xair_sym_binary(state->context,XAIR_OP_AND,1,equal,eq,&next));equal=next;
+    }
+    snprintf(name,sizeof(name),"memcmp_%u_%llu_sign_result",(unsigned)op,(unsigned long long)state->context->stats.model_calls);
+    CMP_NEED(xair_sym_symbol(state->context,bits,name,&value));CMP_NEED(xair_sym_const(state->context,bits,0,&zero));
+    CMP_NEED(xair_sym_binary(state->context,XAIR_OP_EQ,1,value,zero,&eq_result));
+    CMP_NEED(xair_sym_binary(state->context,XAIR_OP_SLT,1,value,zero,&negative));
+    CMP_NEED(xair_sym_binary(state->context,XAIR_OP_EQ,1,eq_result,equal,&rule));
+    CMP_NEED(xair_sym_binary(state->context,XAIR_OP_EQ,1,negative,less,&combined));
+    CMP_NEED(xair_sym_state_assume(state,rule));CMP_NEED(xair_sym_state_assume(state,combined));
+    CMP_NEED(set_call_results(state,op,0,0));
+    CMP_NEED(xair_sym_model_call_result_set(state,op,result_index,value,taint));
+#undef CMP_NEED
+    return XAIR_SYM_OK;
+}
+
 static xair_sym_status environment_call_model(xair_sym_state *state, xair_op_id op, void *user) {
     xair_sym_environment *environment = (xair_sym_environment *)user;
     xair_op_attributes attributes;
@@ -289,6 +329,10 @@ static xair_sym_status environment_call_model(xair_sym_state *state, xair_op_id 
         return unknown_call_fallback(state, op, &attributes);
     }
     if (status != XAIR_SYM_OK) return status;
+    if(kind==XAIR_SYM_MODEL_COMPARE) {
+        status=compare_call(state,op,args,count);
+        return status==XAIR_SYM_ERR_UNSUPPORTED?unknown_call_fallback(state,op,&attributes):status;
+    }
     switch (kind) {
     case XAIR_SYM_MODEL_ALLOC: {
         xair_sym_object_id object;
@@ -457,10 +501,15 @@ static xair_sym_status environment_call_model(xair_sym_state *state, xair_op_id 
         xair_sym_expr_id byte;
         uint64_t byte_value;
         if (count == 0) return XAIR_SYM_ERR_BAD_ARG;
-        while (length < 1024u * 1024u && loop_guard(state->context, length) == XAIR_SYM_OK &&
-            args[count - 1] <= UINT64_MAX - length &&
-            xair_sym_memory_load8(state, args[count - 1] + length, &byte) == XAIR_SYM_OK &&
-            xair_sym_model_u64(state, byte, &byte_value) == XAIR_SYM_OK && byte_value != 0) length++;
+        for (;;) {
+            xair_sym_expr_view view;
+            if(length>=256||args[count-1]>UINT64_MAX-length)return unknown_call_fallback(state,op,&attributes);
+            status=loop_guard(state->context,length);if(status!=XAIR_SYM_OK)return status;
+            if(xair_sym_memory_load8(state,args[count-1]+length,&byte)!=XAIR_SYM_OK||
+               xair_sym_expr_get(state->context,byte,&view)!=XAIR_SYM_OK||view.kind!=XAIR_SYM_EXPR_CONST)
+                return unknown_call_fallback(state,op,&attributes);
+            byte_value=view.immediate;if(byte_value==0)break;++length;
+        }
         result_value = length;
         status = XAIR_SYM_OK;
         break;
@@ -501,7 +550,7 @@ xair_sym_status xair_sym_environment_create_builtin_snapshot(xair_sym_context *c
     if (out_environment != NULL) *out_environment = NULL;
     if (context == NULL || out_environment == NULL ||
         (arch != XAIR_ARCH_X86_32 && arch != XAIR_ARCH_X86_64) ||
-        abi > XAIR_CC_STDCALL_X86 || model_version != UINT64_C(0x00010000) ||
+        abi > XAIR_CC_STDCALL_X86 || model_version != UINT64_C(0x00010001) ||
         stack_size == 0 || stack_base > UINT64_MAX - (stack_size - 1u)) return XAIR_SYM_ERR_BAD_ARG;
     environment = (xair_sym_environment *)calloc(1, sizeof(*environment));
     if (environment == NULL) return XAIR_SYM_ERR_OOM;
@@ -691,7 +740,7 @@ xair_sym_status xair_sym_process_create(
     environment->context = context; environment->arch = binary->arch;
     environment->abi = options->abi != XAIR_CC_UNKNOWN ? options->abi :
         (binary->format == XAIR_BINARY_FORMAT_PE ? XAIR_CC_WIN64 : XAIR_CC_SYSV_X64);
-    environment->model_version = UINT64_C(0x00010000);
+    environment->model_version = UINT64_C(0x00010001);
     environment->stack_base = options->stack_base; environment->stack_size = options->stack_size;
     environment->heap_next = binary->arch == XAIR_ARCH_X86_32 ? UINT64_C(0x50000000) : UINT64_C(0x0000600000000000);
     status = xair_sym_state_create(context, xair_cfg_module(cfg), node->ir_block, &state);
@@ -847,6 +896,12 @@ xair_sym_status xair_sym_environment_model(
     if (xair_sym_environment_model_info(environment, name, &info) != XAIR_SYM_OK) return XAIR_SYM_ERR_BAD_ARG;
     *out_kind = info.kind;
     return XAIR_SYM_OK;
+}
+
+xair_sym_status xair_sym_environment_create_builtin(xair_sym_context *context,
+    xair_arch arch,xair_calling_convention abi,xair_sym_environment **out_environment) {
+    return xair_sym_environment_create_builtin_snapshot(context,arch,abi,
+        UINT64_C(0x00010001),UINT64_C(0x70000000),4096,UINT64_C(0x40000000),out_environment);
 }
 
 xair_sym_status xair_sym_environment_model_info(

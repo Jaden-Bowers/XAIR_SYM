@@ -135,7 +135,7 @@ static void sweep_snapshot_and_environment(const xair_module *module,
     require_sym(xair_sym_context_create(&context));
     require_sym(xair_sym_state_create(context, module, block, &state));
     require_sym(xair_sym_environment_create_builtin_snapshot(context, XAIR_ARCH_X86_64,
-        XAIR_CC_SYSV_X64, UINT64_C(0x00010000), UINT64_C(0x70000000),
+        XAIR_CC_SYSV_X64, UINT64_C(0x00010001), UINT64_C(0x70000000),
         0x1000, UINT64_C(0x40000000), &environment));
     xair_sym_environment_attach_builtin(state, environment);
     environment = NULL;
